@@ -107,7 +107,9 @@ def test_retrieve() -> None:
     mock_embed = AsyncMock(return_value=[[0.1] * 1536])
 
     with patch(_STORE, store), patch(_EMBED, mock_embed):
-        r = client.get("/retrieve", params={"q": "hello function", "collection_id": "coll-1", "k": 3})
+        r = client.get(
+            "/retrieve", params={"q": "hello function", "collection_id": "coll-1", "k": 3}
+        )
     assert r.status_code == 200
     results = r.json()["results"]
     assert len(results) == 1
