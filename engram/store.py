@@ -65,11 +65,10 @@ class Store:
 
             yoyo_dsn = dsn.replace("postgresql://", "postgresql+psycopg://", 1)
             backend = get_backend(yoyo_dsn, migration_table="_engram_yoyo_migrations")
-            # Isolate all yoyo internal tables per-service so they don't
-            # collide when Hive/Mneme/Engram share the same Postgres database.
+            # Isolate log + version tables per-service so they don't collide
+            # when Hive/Mneme/Engram share the same Postgres database.
             backend.log_table = "_engram_yoyo_log"
             backend.version_table = "_engram_yoyo_version"
-            backend.lock_table = "engram_yoyo_lock"
             migrations = read_migrations(migrations_dir)
             with backend.lock():
                 backend.apply_migrations(backend.to_apply(migrations))
