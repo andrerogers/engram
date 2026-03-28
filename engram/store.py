@@ -64,7 +64,7 @@ class Store:
             from yoyo import get_backend, read_migrations
 
             yoyo_dsn = dsn.replace("postgresql://", "postgresql+psycopg://", 1)
-            backend = get_backend(yoyo_dsn)
+            backend = get_backend(yoyo_dsn, migration_table="_engram_yoyo_log")
             migrations = read_migrations(migrations_dir)
             with backend.lock():
                 backend.apply_migrations(backend.to_apply(migrations))
