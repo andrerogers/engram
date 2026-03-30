@@ -38,6 +38,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _store = Store(DATABASE_URL)
         await _store.init_db()
     yield
+    if _store is not None:
+        await _store.close()
 
 
 app = FastAPI(title="Engram", version="0.1.0", lifespan=lifespan)
