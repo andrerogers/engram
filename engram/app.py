@@ -3,10 +3,13 @@ from optics import instrument_fastapi, setup_optics
 
 setup_optics("engram", service_version="0.0.1")
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+
+log = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
 
 from engram import embeddings
@@ -37,9 +40,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if DATABASE_URL:
         _store = Store(DATABASE_URL)
         await _store.init_db()
+        log.info("engram started — store initialised")
+    else:
+        log.warning("engram started — no DATABASE_URL, store unavailable")
     yield
     if _store is not None:
         await _store.close()
+        log.info("engram shutting down — store closed")
 
 
 app = FastAPI(title="Engram", version="0.1.0", lifespan=lifespan)
@@ -100,6 +107,7 @@ async def index_documents(req: IndexRequest) -> IndexResponse:
         cid = await store.get_or_create_collection(workspace_id, collection_name)
 
     doc_count, chunk_count = await _index_documents(store, cid, req.documents)
+    log.info("indexed collection=%s docs=%d chunks=%d", cid, doc_count, chunk_count)
     return IndexResponse(
         indexed_count=doc_count,
         collection_id=cid,
