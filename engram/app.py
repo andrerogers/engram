@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
 
 from engram import embeddings
+from engram.clients.docling import DoclingClient
 from engram.config import DATABASE_URL
 from engram.models import (
     CollectionOut,
@@ -26,6 +27,7 @@ from engram.processors.tiktoken_processor import TiktokenProcessor
 from engram.store import Store
 
 _processor = TiktokenProcessor()
+_docling: DoclingClient = DoclingClient()
 
 _store: Store | None = None
 
@@ -39,6 +41,7 @@ def _get_store() -> Store:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _store  # noqa: PLW0603
+    await _docling.startup()
     if DATABASE_URL:
         _store = Store(DATABASE_URL)
         await _store.init_db()
@@ -49,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if _store is not None:
         await _store.close()
         log.info("engram shutting down — store closed")
+    await _docling.shutdown()
 
 
 app = FastAPI(title="Engram", version="0.1.0", lifespan=lifespan)
