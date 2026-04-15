@@ -13,6 +13,7 @@ dependencies = [
     "yoyo-migrations>=8.2",
     "httpx>=0.28",
     "tiktoken>=0.9",
+    "aioboto3>=13.0",
     "brainstack-optics",
 ]
 
@@ -40,12 +41,16 @@ python_version = "3.13"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["optics", "optics.*", "yoyo", "tiktoken"]
+module = ["optics", "optics.*", "yoyo", "tiktoken", "aioboto3", "aioboto3.*", "botocore", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: tests that require external services (MinIO, Docling, Postgres)",
+]
+addopts = "-m 'not integration'"
 
 [tool.uv]
 python-preference = "only-managed"
