@@ -274,6 +274,237 @@ class Store:
 
         return await self._run(_do)
 
+    async def insert_document_with_chunks(  # noqa: PLR0913
+        self,
+        collection_id: str,
+        path: str | None,
+        metadata: dict[str, str] | None,
+        candidates: list[ChunkCandidate],
+        embeddings: list[list[float]],
+        object_key: str | None = None,
+        source_mime: str | None = None,
+        file_size: int | None = None,
+        file_hash: str | None = None,
+    ) -> tuple[str, int]:
+        """Store a document (with optional object-store fields) and its chunks.
+
+        Used by the async ingest job runner (E9) where files have already been
+        uploaded to MinIO before chunking begins.
+
+        Returns:
+            (document_id, chunk_count)
+        """
+        doc_id = str(uuid.uuid4())
+        meta_json = _json.dumps(metadata or {})
+
+        async def _do(conn: Any) -> tuple[str, int]:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO engram.documents "
+                    "(id, collection_id, path, metadata, object_key, source_mime, file_size, file_hash) "
+                    "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s)",
+                    (doc_id, collection_id, path, meta_json, object_key, source_mime, file_size, file_hash),
+                )
+                for candidate, embedding in zip(candidates, embeddings, strict=True):
+                    chunk_id = str(uuid.uuid4())
+                    await conn.execute(
+                        "INSERT INTO engram.chunks "
+                        "(id, document_id, content, chunk_index, embedding, "
+                        " modality, chunker, chunker_version, media_ref, media_metadata) "
+                        "VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb)",
+                        (
+                            chunk_id,
+                            doc_id,
+                            candidate.content,
+                            candidate.chunk_index,
+                            str(embedding),
+                            candidate.modality,
+                            candidate.chunker,
+                            candidate.chunker_version,
+                            candidate.media_ref,
+                            _json.dumps(candidate.media_metadata or {}),
+                        ),
+                    )
+            return doc_id, len(candidates)
+
+        return await self._run(_do)
+
+    # ── Ingest jobs ───────────────────────────────────────────────────────
+
+    async def create_ingest_job(
+        self,
+        collection_id: str,
+        filename: str | None = None,
+        object_key: str | None = None,
+    ) -> str:
+        """Create a new ingest job in 'pending' state. Returns job_id."""
+        job_id = str(uuid.uuid4())
+
+        async def _do(conn: Any) -> str:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO engram.ingest_jobs "
+                    "(id, collection_id, filename, object_key, status) "
+                    "VALUES (%s, %s, %s, %s, 'pending')",
+                    (job_id, collection_id, filename, object_key),
+                )
+            return job_id
+
+        return await self._run(_do)
+
+    async def get_ingest_job(self, job_id: str) -> dict[str, Any] | None:
+        """Return a job row or None."""
+
+        async def _do(conn: Any) -> dict[str, Any] | None:
+            row = await (
+                await conn.execute(
+                    "SELECT id, collection_id, document_id, status, filename, "
+                    "object_key, error_message, last_heartbeat, created_at, updated_at "
+                    "FROM engram.ingest_jobs WHERE id = %s",
+                    (job_id,),
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "id": row[0],
+                "collection_id": row[1],
+                "document_id": row[2],
+                "status": row[3],
+                "filename": row[4],
+                "object_key": row[5],
+                "error_message": row[6],
+                "last_heartbeat": row[7].isoformat() if row[7] else None,
+                "created_at": row[8].isoformat(),
+                "updated_at": row[9].isoformat(),
+            }
+
+        return await self._run(_do)
+
+    async def update_ingest_job(
+        self,
+        job_id: str,
+        status: str,
+        document_id: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Update job status (and optionally document_id / error_message)."""
+
+        async def _do(conn: Any) -> None:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE engram.ingest_jobs SET status = %s, document_id = COALESCE(%s, document_id), "
+                    "error_message = COALESCE(%s, error_message), updated_at = now() "
+                    "WHERE id = %s",
+                    (status, document_id, error_message, job_id),
+                )
+
+        await self._run(_do)
+
+    async def bump_heartbeat(self, job_id: str) -> None:
+        """Update last_heartbeat to now() — called by the worker every ~10s."""
+
+        async def _do(conn: Any) -> None:
+            await conn.execute(
+                "UPDATE engram.ingest_jobs SET last_heartbeat = now() WHERE id = %s",
+                (job_id,),
+            )
+
+        await self._run(_do)
+
+    async def list_ingest_jobs(
+        self,
+        collection_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List jobs, optionally filtered by collection and/or status."""
+
+        async def _do(conn: Any) -> list[dict[str, Any]]:
+            filters: list[str] = []
+            params: list[Any] = []
+            if collection_id:
+                filters.append("collection_id = %s")
+                params.append(collection_id)
+            if status:
+                filters.append("status = %s")
+                params.append(status)
+            where = "WHERE " + " AND ".join(filters) if filters else ""
+            rows = await (
+                await conn.execute(
+                    f"SELECT id, collection_id, document_id, status, filename, "
+                    f"object_key, error_message, last_heartbeat, created_at, updated_at "
+                    f"FROM engram.ingest_jobs {where} ORDER BY created_at DESC",
+                    params,
+                )
+            ).fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "collection_id": r[1],
+                    "document_id": r[2],
+                    "status": r[3],
+                    "filename": r[4],
+                    "object_key": r[5],
+                    "error_message": r[6],
+                    "last_heartbeat": r[7].isoformat() if r[7] else None,
+                    "created_at": r[8].isoformat(),
+                    "updated_at": r[9].isoformat(),
+                }
+                for r in rows
+            ]
+
+        return await self._run(_do)
+
+    async def delete_old_ingest_jobs(self, retention_days: int = 7) -> int:
+        """Delete completed/failed jobs older than retention_days. Returns count deleted."""
+
+        async def _do(conn: Any) -> int:
+            result = await conn.execute(
+                "DELETE FROM engram.ingest_jobs "
+                "WHERE status IN ('completed', 'failed') "
+                "AND updated_at < now() - interval '1 day' * %s",
+                (retention_days,),
+            )
+            return int(result.rowcount)
+
+        return await self._run(_do)
+
+    async def recover_orphan_jobs(self, stale_seconds: int = 60) -> int:
+        """Re-queue jobs stuck in 'processing' with a stale heartbeat.
+
+        A job is stale if its last_heartbeat is older than stale_seconds ago
+        (using DB now() to avoid app-clock drift). Returns count recovered.
+        """
+
+        async def _do(conn: Any) -> int:
+            result = await conn.execute(
+                "UPDATE engram.ingest_jobs SET status = 'pending', "
+                "error_message = 'recovered: worker heartbeat stale', updated_at = now() "
+                "WHERE status = 'processing' "
+                "AND last_heartbeat < now() - interval '1 second' * %s",
+                (stale_seconds,),
+            )
+            return int(result.rowcount)
+
+        return await self._run(_do)
+
+    async def _sweep_orphan_objects(
+        self, object_store: object, log: Any = None
+    ) -> int:
+        """Delete object-store keys that have no matching job or document.
+
+        Called on startup to clean up partial uploads from crashed workers.
+        Returns the count of swept objects.
+
+        Note: This requires a concrete object_store implementation — the store
+        itself has no dependency on the ObjectStore ABC to keep the layers clean.
+        The caller (lifespan) passes the configured store.
+        """
+        # Placeholder implementation — full sweep requires listing object keys
+        # from MinIO and cross-referencing against DB. This will be fleshed out
+        # in E9 (job runner + lifespan wiring) when both stores are available.
+        return 0
+
     async def retrieve(
         self,
         embedding: list[float],
