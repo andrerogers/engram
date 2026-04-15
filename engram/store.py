@@ -14,6 +14,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from engram.processors.base import ChunkCandidate
+
 log = logging.getLogger(__name__)
 
 _MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
@@ -146,6 +148,79 @@ class Store:
 
         return await self._run(_do)
 
+    # ── Documents ─────────────────────────────────────────────────────────
+
+    async def list_documents(self, collection_id: str) -> list[dict[str, Any]]:
+        """Return all documents in a collection (no chunk data)."""
+
+        async def _do(conn: Any) -> list[dict[str, Any]]:
+            rows = await (
+                await conn.execute(
+                    "SELECT id, collection_id, path, metadata, created_at "
+                    "FROM engram.documents WHERE collection_id = %s ORDER BY created_at DESC",
+                    (collection_id,),
+                )
+            ).fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "collection_id": r[1],
+                    "path": r[2],
+                    "metadata": r[3],
+                    "created_at": r[4].isoformat(),
+                }
+                for r in rows
+            ]
+
+        return await self._run(_do)
+
+    async def get_document(self, document_id: str) -> dict[str, Any] | None:
+        """Return a single document by ID, or None if not found."""
+
+        async def _do(conn: Any) -> dict[str, Any] | None:
+            row = await (
+                await conn.execute(
+                    "SELECT id, collection_id, path, metadata, created_at "
+                    "FROM engram.documents WHERE id = %s",
+                    (document_id,),
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "id": row[0],
+                "collection_id": row[1],
+                "path": row[2],
+                "metadata": row[3],
+                "created_at": row[4].isoformat(),
+            }
+
+        return await self._run(_do)
+
+    async def delete_document(self, document_id: str) -> str | None:
+        """Delete a document and its chunks. Returns object_key if present (for caller cleanup).
+
+        Returns None if the document does not exist.
+        """
+
+        async def _do(conn: Any) -> str | None:
+            row = await (
+                await conn.execute(
+                    "SELECT object_key FROM engram.documents WHERE id = %s",
+                    (document_id,),
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            object_key: str | None = row[0]
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM engram.documents WHERE id = %s", (document_id,)
+                )
+            return object_key
+
+        return await self._run(_do)
+
     # ── Documents + Chunks ────────────────────────────────────────────────
 
     async def index_document(
@@ -153,12 +228,17 @@ class Store:
         collection_id: str,
         path: str | None,
         metadata: dict[str, str] | None,
-        chunks: list[str],
+        candidates: list[ChunkCandidate],
         embeddings: list[list[float]],
     ) -> tuple[str, int]:
         """Store a document and its chunks with embeddings.
 
-        Returns (document_id, chunk_count).
+        Args:
+            candidates: ChunkCandidate list from a processor (carries modality/chunker metadata).
+            embeddings: Per-candidate embedding vectors (must match len(candidates)).
+
+        Returns:
+            (document_id, chunk_count)
         """
         doc_id = str(uuid.uuid4())
         meta_json = _json.dumps(metadata or {})
@@ -170,15 +250,27 @@ class Store:
                     "VALUES (%s, %s, %s, %s::jsonb)",
                     (doc_id, collection_id, path, meta_json),
                 )
-                for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings, strict=True)):
+                for candidate, embedding in zip(candidates, embeddings, strict=True):
                     chunk_id = str(uuid.uuid4())
                     await conn.execute(
                         "INSERT INTO engram.chunks "
-                        "(id, document_id, content, chunk_index, embedding) "
-                        "VALUES (%s, %s, %s, %s, %s::vector)",
-                        (chunk_id, doc_id, chunk_text, i, str(embedding)),
+                        "(id, document_id, content, chunk_index, embedding, "
+                        " modality, chunker, chunker_version, media_ref, media_metadata) "
+                        "VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb)",
+                        (
+                            chunk_id,
+                            doc_id,
+                            candidate.content,
+                            candidate.chunk_index,
+                            str(embedding),
+                            candidate.modality,
+                            candidate.chunker,
+                            candidate.chunker_version,
+                            candidate.media_ref,
+                            _json.dumps(candidate.media_metadata or {}),
+                        ),
                     )
-            return doc_id, len(chunks)
+            return doc_id, len(candidates)
 
         return await self._run(_do)
 
@@ -187,18 +279,29 @@ class Store:
         embedding: list[float],
         collection_id: str,
         k: int = 5,
+        modalities: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        """Vector search chunks in a collection.
+
+        Args:
+            modalities: Filter to these modalities (default: ["text"]).
+        """
+        effective_modalities = modalities if modalities is not None else ["text"]
+
         async def _do(conn: Any) -> list[dict[str, Any]]:
             vec_str = str(embedding)
+            # Build modality placeholder list: (%s, %s, ...)
+            placeholders = ", ".join(["%s"] * len(effective_modalities))
             rows = await (
                 await conn.execute(
-                    "SELECT c.id, d.path, c.content, "
-                    "1 - (c.embedding <=> %s::vector) AS score "
-                    "FROM engram.chunks c "
-                    "JOIN engram.documents d ON d.id = c.document_id "
-                    "WHERE d.collection_id = %s AND c.embedding IS NOT NULL "
-                    "ORDER BY c.embedding <=> %s::vector LIMIT %s",
-                    (vec_str, collection_id, vec_str, k),
+                    f"SELECT c.id, d.path, c.content, c.modality, c.chunker, "
+                    f"1 - (c.embedding <=> %s::vector) AS score "
+                    f"FROM engram.chunks c "
+                    f"JOIN engram.documents d ON d.id = c.document_id "
+                    f"WHERE d.collection_id = %s AND c.embedding IS NOT NULL "
+                    f"AND c.modality IN ({placeholders}) "
+                    f"ORDER BY c.embedding <=> %s::vector LIMIT %s",
+                    (vec_str, collection_id, *effective_modalities, vec_str, k),
                 )
             ).fetchall()
             return [
@@ -206,7 +309,9 @@ class Store:
                     "chunk_id": r[0],
                     "document_path": r[1],
                     "content": r[2],
-                    "score": float(r[3]),
+                    "modality": r[3],
+                    "chunker": r[4],
+                    "score": float(r[5]),
                 }
                 for r in rows
             ]

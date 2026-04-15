@@ -45,6 +45,8 @@ class RetrieveResult(BaseModel):
     document_path: str | None
     content: str
     score: float
+    modality: str = "text"
+    chunker: str = "tiktoken-fallback"
 
 
 class RetrieveResponse(BaseModel):

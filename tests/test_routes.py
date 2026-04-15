@@ -5,22 +5,40 @@ The store and embeddings are mocked so tests run without Postgres or API keys.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 from engram.app import app
+from engram.processors.base import ChunkCandidate, ChunkerKind, Modality
 
 client = TestClient(app)
 
 _STORE = "engram.app._store"
 _EMBED = "engram.app.embeddings.embed"
+_PROCESSOR = "engram.app._processor"
 
 
 def _mock_store() -> AsyncMock:
     store = AsyncMock()
     store.init_db = AsyncMock()
     return store
+
+
+def _mock_processor(chunks: list[str]) -> MagicMock:
+    """Return a mock processor whose process() returns ChunkCandidates."""
+    candidates = [
+        ChunkCandidate(
+            content=c,
+            chunk_index=i,
+            modality=Modality.TEXT,
+            chunker=ChunkerKind.TIKTOKEN_FALLBACK,
+        )
+        for i, c in enumerate(chunks)
+    ]
+    proc = MagicMock()
+    proc.process.return_value = candidates
+    return proc
 
 
 # ---------------------------------------------------------------------------
@@ -43,13 +61,13 @@ def test_index_documents() -> None:
     store = _mock_store()
     store.get_or_create_collection = AsyncMock(return_value="coll-1")
     store.index_document = AsyncMock(return_value=("doc-1", 2))
-
     mock_embed = AsyncMock(return_value=[[0.1] * 1536, [0.2] * 1536])
+    mock_proc = _mock_processor(["chunk 1", "chunk 2"])
 
     with (
         patch(_STORE, store),
         patch(_EMBED, mock_embed),
-        patch("engram.app.chunk_text", return_value=["chunk 1", "chunk 2"]),
+        patch(_PROCESSOR, mock_proc),
     ):
         r = client.post(
             "/index",
@@ -63,18 +81,21 @@ def test_index_documents() -> None:
     body = r.json()
     assert body["indexed_count"] == 1
     assert body["collection_id"] == "coll-1"
+    # Verify chunker label passed through to store
+    call_kwargs = store.index_document.call_args.kwargs
+    assert all(c.chunker == ChunkerKind.TIKTOKEN_FALLBACK for c in call_kwargs["candidates"])
 
 
 def test_index_with_existing_collection_id() -> None:
     store = _mock_store()
     store.index_document = AsyncMock(return_value=("doc-1", 1))
-
     mock_embed = AsyncMock(return_value=[[0.1] * 1536])
+    mock_proc = _mock_processor(["chunk 1"])
 
     with (
         patch(_STORE, store),
         patch(_EMBED, mock_embed),
-        patch("engram.app.chunk_text", return_value=["chunk 1"]),
+        patch(_PROCESSOR, mock_proc),
     ):
         r = client.post(
             "/index",
@@ -100,6 +121,8 @@ def test_retrieve() -> None:
                 "chunk_id": "c-1",
                 "document_path": "test.py",
                 "content": "def hello(): pass",
+                "modality": "text",
+                "chunker": "tiktoken-fallback",
                 "score": 0.92,
             }
         ]
@@ -114,6 +137,8 @@ def test_retrieve() -> None:
     results = r.json()["results"]
     assert len(results) == 1
     assert results[0]["content"] == "def hello(): pass"
+    assert results[0]["chunker"] == "tiktoken-fallback"
+    assert results[0]["modality"] == "text"
 
 
 def test_retrieve_requires_collection_id() -> None:

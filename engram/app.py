@@ -13,7 +13,6 @@ log = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
 
 from engram import embeddings
-from engram.chunker import chunk_text
 from engram.config import DATABASE_URL
 from engram.models import (
     CollectionOut,
@@ -23,7 +22,10 @@ from engram.models import (
     RetrieveResponse,
     RetrieveResult,
 )
+from engram.processors.tiktoken_processor import TiktokenProcessor
 from engram.store import Store
+
+_processor = TiktokenProcessor()
 
 _store: Store | None = None
 
@@ -80,15 +82,15 @@ async def _index_documents(
     """Chunk, embed, and store documents. Returns (doc_count, chunk_count)."""
     total_chunks = 0
     for doc in documents:
-        chunks = chunk_text(doc.content)
-        if not chunks:
+        candidates = _processor.process(doc.content)
+        if not candidates:
             continue
-        vecs = await embeddings.embed(chunks)
+        vecs = await embeddings.embed([c.content for c in candidates])
         _, n = await store.index_document(
             collection_id=collection_id,
             path=doc.path,
             metadata=doc.metadata,
-            chunks=chunks,
+            candidates=candidates,
             embeddings=vecs,
         )
         total_chunks += n
