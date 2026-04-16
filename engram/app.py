@@ -31,6 +31,7 @@ from engram.jobs.runner import Runner
 from engram.models import (
     CollectionOut,
     DocumentIn,
+    DocumentOut,
     FileIngestResponse,
     IndexRequest,
     IndexResponse,
@@ -266,6 +267,34 @@ async def ingest_job_status(job_id: str) -> IngestJobOut:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return IngestJobOut(**job)
+
+
+# ── Document management ───────────────────────────────────────────────────
+
+
+@app.get("/documents", response_model=list[DocumentOut])
+async def list_documents(
+    collection_id: str = Query(..., description="Collection to list documents from"),
+) -> list[DocumentOut]:
+    store = _get_store()
+    rows = await store.list_documents(collection_id)
+    return [DocumentOut(**r) for r in rows]
+
+
+@app.delete("/documents/{document_id}", status_code=204)
+async def delete_document(document_id: str) -> None:
+    """Delete a document, its chunks (via FK cascade), and original object if present."""
+    store = _get_store()
+    doc = await store.get_document(document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    await store.delete_document(document_id)
+    object_key = doc.get("object_key")
+    if object_key:
+        try:
+            await _object_store.delete(object_key)
+        except KeyError:
+            log.warning("delete_document: object already missing key=%s", object_key)
 
 
 # ── Document access ───────────────────────────────────────────────────────

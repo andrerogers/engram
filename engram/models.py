@@ -93,3 +93,16 @@ class CollectionOut(BaseModel):
     workspace_id: str
     name: str
     created_at: str
+
+
+# ---------------------------------------------------------------------------
+# Documents
+# ---------------------------------------------------------------------------
+
+
+class DocumentOut(BaseModel):
+    id: str
+    collection_id: str
+    path: str | None = None
+    metadata: dict[str, str] | None = None
+    created_at: str

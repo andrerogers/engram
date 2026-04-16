@@ -317,3 +317,108 @@ def test_object_passthrough_disabled_with_minio() -> None:
         r = client.get(f"/documents/_object/{_OBJECT_KEY}")
 
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /documents
+# ---------------------------------------------------------------------------
+
+
+def test_list_documents_returns_rows() -> None:
+    store = _mock_store()
+    store.list_documents = AsyncMock(
+        return_value=[
+            {
+                "id": _DOC_ID,
+                "collection_id": _COLLECTION_ID,
+                "path": "sample.pdf",
+                "metadata": {},
+                "created_at": "2026-04-16T12:00:00+00:00",
+            }
+        ]
+    )
+
+    with patch(_STORE, store):
+        r = client.get("/documents", params={"collection_id": _COLLECTION_ID})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["id"] == _DOC_ID
+    store.list_documents.assert_awaited_once_with(_COLLECTION_ID)
+
+
+def test_list_documents_requires_collection_id() -> None:
+    store = _mock_store()
+
+    with patch(_STORE, store):
+        r = client.get("/documents")
+
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# DELETE /documents/{id}
+# ---------------------------------------------------------------------------
+
+
+def test_delete_document_removes_object() -> None:
+    store = _mock_store()
+    store.delete_document = AsyncMock(return_value=_OBJECT_KEY)
+    obj = _mock_object_store()
+
+    with patch(_STORE, store), patch(_OBJECT_STORE, obj):
+        r = client.delete(f"/documents/{_DOC_ID}")
+
+    assert r.status_code == 204
+    store.delete_document.assert_awaited_once_with(_DOC_ID)
+    obj.delete.assert_awaited_once_with(_OBJECT_KEY)
+
+
+def test_delete_document_without_object_key() -> None:
+    store = _mock_store()
+    store.get_document = AsyncMock(
+        return_value={
+            "id": _DOC_ID,
+            "collection_id": _COLLECTION_ID,
+            "path": "inline.txt",
+            "metadata": {},
+            "object_key": None,
+            "created_at": "2026-04-16T12:00:00+00:00",
+        }
+    )
+    store.delete_document = AsyncMock(return_value=None)
+    obj = _mock_object_store()
+
+    with patch(_STORE, store), patch(_OBJECT_STORE, obj):
+        r = client.delete(f"/documents/{_DOC_ID}")
+
+    assert r.status_code == 204
+    store.delete_document.assert_awaited_once_with(_DOC_ID)
+    obj.delete.assert_not_awaited()
+
+
+def test_delete_document_404_when_missing() -> None:
+    store = _mock_store()
+    store.get_document = AsyncMock(return_value=None)
+    store.delete_document = AsyncMock()
+    obj = _mock_object_store()
+
+    with patch(_STORE, store), patch(_OBJECT_STORE, obj):
+        r = client.delete(f"/documents/{_DOC_ID}")
+
+    assert r.status_code == 404
+    store.delete_document.assert_not_awaited()
+    obj.delete.assert_not_awaited()
+
+
+def test_delete_document_tolerates_missing_object() -> None:
+    store = _mock_store()
+    store.delete_document = AsyncMock(return_value=_OBJECT_KEY)
+    obj = _mock_object_store()
+    obj.delete = AsyncMock(side_effect=KeyError("gone"))
+
+    with patch(_STORE, store), patch(_OBJECT_STORE, obj):
+        r = client.delete(f"/documents/{_DOC_ID}")
+
+    assert r.status_code == 204
