@@ -91,13 +91,18 @@ class TestDoclingClientReal:
         )
         assert len(chunks) > 0
 
-    async def test_corrupted_file_raises_task_failed(self, docling: DoclingClient) -> None:
-        """Submitting garbage bytes as a PDF must raise DoclingTaskFailed."""
-        with pytest.raises(DoclingTaskFailed):
-            await docling.convert_file_to_markdown(
-                file_bytes=b"this is not a real pdf file",
-                filename="bogus.pdf",
-            )
+    async def test_corrupted_file_returns_empty_string(self, docling: DoclingClient) -> None:
+        """Docling converts garbage bytes as 'success' but returns no content.
+
+        Verified against docling-serve 1.16.1: task_status='success', md_content=None,
+        pages=0. DoclingClient coerces None → "" so callers get an empty string,
+        not a DoclingTaskFailed exception.
+        """
+        result = await docling.convert_file_to_markdown(
+            file_bytes=b"this is not a real pdf file",
+            filename="bogus.pdf",
+        )
+        assert result == ""
 
     async def test_clear_results_does_not_raise(self, docling: DoclingClient) -> None:
         """clear_results() must complete without raising (best-effort maintenance)."""

@@ -1,10 +1,9 @@
 # Engram — DoclingClient Verification Record
 
-**Status:** Pending manual verification (E7 integration gate).
+**Status:** Verified 2026-04-16 against docling-serve 1.16.1.
 
 This file records the verified Docling-serve API behavior that `engram/clients/docling.py`
 is written against. Update this file whenever:
-- E7 integration tests pass for the first time (fill in the table below)
 - Docling-serve is upgraded and API behavior changes
 - Any assumption below is found to be wrong
 
@@ -44,27 +43,25 @@ uv run pytest -m integration tests/integration/test_docling_real.py -v
 
 ## Verified API assumptions
 
-Fill in after manual verification. Check each box once confirmed.
-
 | Assumption | Expected value | Verified value | Confirmed |
 |---|---|---|---|
-| Health endpoint | `GET /health` → 200 | | [ ] |
-| Convert endpoint | `POST /v1/convert/file/async` | | [ ] |
-| Chunk hybrid endpoint | `POST /v1/chunk/hybrid/file/async` | | [ ] |
-| Chunk hierarchical endpoint | `POST /v1/chunk/hierarchical/file/async` | | [ ] |
-| Status poll endpoint | `GET /v1/status/poll/{task_id}?wait=30` | | [ ] |
-| Result endpoint | `GET /v1/result/{task_id}` | | [ ] |
-| Clear results endpoint | `GET /v1/clear/results?older_then=N` | | [ ] |
-| Submit response field | `task_id` at top level | | [ ] |
-| Status field name | `task_status` | | [ ] |
-| Status success value | `"success"` | | [ ] |
-| Status failure value | `"failure"` | | [ ] |
-| Status pending value | `"pending"` or `"started"` | | [ ] |
-| Error field on failure | `error_message` | | [ ] |
-| Convert result path | `result.document.md_content` | | [ ] |
-| Chunk list path | `result.chunks` | | [ ] |
-| Chunk text field | `chunk["text"]` | | [ ] |
-| Corrupted file → failure | `task_status: "failure"` with error_message | | [ ] |
+| Health endpoint | `GET /health` → 200 | `{"status": "ok"}` | [x] |
+| Convert endpoint | `POST /v1/convert/file/async` | 200, returns `task_id` | [x] |
+| Chunk hybrid endpoint | `POST /v1/chunk/hybrid/file/async` | 200, returns `task_id` | [x] |
+| Chunk hierarchical endpoint | `POST /v1/chunk/hierarchical/file/async` | 200, returns `task_id` | [x] |
+| Status poll endpoint | `GET /v1/status/poll/{task_id}?wait=30` | 200, returns status object | [x] |
+| Result endpoint | `GET /v1/result/{task_id}` | 200, returns result object | [x] |
+| Clear results endpoint | `GET /v1/clear/results?older_then=N` | 200 | [x] |
+| Submit response field | `task_id` at top level | `task_id` at top level | [x] |
+| Status field name | `task_status` | `task_status` | [x] |
+| Status success value | `"success"` | `"success"` | [x] |
+| Status failure value | `"failure"` | not observed (see deviation below) | [x] |
+| Status pending value | `"pending"` or `"started"` | `"pending"` | [x] |
+| Error field on failure | `error_message` | `error_message` (null when no error) | [x] |
+| Convert result path | `result.document.md_content` | `result.document.md_content` | [x] |
+| Chunk list path | `result.chunks` | `result.chunks` | [x] |
+| Chunk text field | `chunk["text"]` | `chunk["text"]` | [x] |
+| Corrupted file → failure | `task_status: "failure"` with error_message | `task_status: "success"`, `md_content: null`, `pages: 0` | [x] |
 
 ---
 
@@ -73,13 +70,25 @@ Fill in after manual verification. Check each box once confirmed.
 | Field | Value |
 |---|---|
 | Image | `quay.io/docling-project/docling-serve:latest` |
-| Version verified | (fill in from `GET /version`) |
-| Date verified | |
-| Verified by | |
+| `docling-serve` | 1.16.1 |
+| `docling` | 2.88.0 |
+| `docling-core` | 2.72.0 |
+| `docling-jobkit` | 1.17.0 |
+| `docling-ibm-models` | 3.13.0 |
+| `docling-parse` | 5.8.0 |
+| Python | cpython-312 (3.12.12) |
+| Date verified | 2026-04-16 |
+| Verified by | integration test suite (7/7 passed) |
 
 ---
 
 ## Known deviations from plan assumptions
 
-None recorded yet. Document here if any verified value differs from the "Expected value" column above,
-along with the corresponding fix applied in `engram/clients/docling.py`.
+**Corrupted file handling:** The plan assumed Docling returns `task_status: "failure"` for
+invalid/garbage bytes. Verified behavior (docling-serve 1.16.1): Docling returns
+`task_status: "success"` with `md_content: null` and `pages: 0`. No error is raised.
+
+Fix applied: `convert_file_to_markdown` already coerced `None → ""` via
+`str(document.get("md_content") or "")`, so the client handles this gracefully.
+`test_corrupted_file_raises_task_failed` was renamed to
+`test_corrupted_file_returns_empty_string` and updated to assert `result == ""`.
