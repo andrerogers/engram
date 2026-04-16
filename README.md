@@ -1,6 +1,6 @@
 # Engram
 
-**Engram** is the RAG (Retrieval-Augmented Generation) service of [brainstack](https://github.com/andrerogers/brainstack). It handles document indexing with token-aware chunking, OpenRouter embeddings, and pgvector similarity search — giving Hive access to a searchable knowledge base during chat.
+**Engram** is the RAG (Retrieval-Augmented Generation) service of [brainstack](https://github.com/andrerogers/brainstack). It handles async document ingestion via Docling, MinIO object storage, token-aware chunking, OpenRouter embeddings, and pgvector similarity search — giving Hive access to a searchable, multimodal-ready knowledge base.
 
 ---
 
@@ -8,11 +8,13 @@
 
 ```
 Hive (orchestration core)
-  │  HTTP  GET /retrieve?query=…   ← fetch relevant chunks for a chat request
-  │  HTTP  POST /index             ← index a document (separate from chat)
+  │  HTTP  POST /index             ← index text documents
+  │  HTTP  POST /index/file        ← async file ingestion (E10+)
+  │  HTTP  GET  /retrieve          ← fetch relevant chunks for a chat request
   ▼
-Engram (FastAPI) — chunking · embedding · retrieval
-  │
+Engram (FastAPI :8613)
+  │  Docling-serve sidecar (:5001) — PDF/DOCX → Markdown + chunking
+  │  MinIO (:9000)                 — raw file storage (Postgres holds zero bytes)
   ▼
 PostgreSQL + pgvector (engram.* schema)
   │  OpenRouter embeddings
@@ -29,10 +31,12 @@ Hive calls Engram directly over HTTP — Cortex does not proxy these calls.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check |
-| `POST` | `/index` | Chunk, embed, and index a document into a collection |
-| `GET` | `/retrieve` | Semantic search — embed query, return top-k chunks |
-| `GET` | `/collections` | List all collections |
-| `DELETE` | `/collections/{id}` | Delete a collection and all its chunks |
+| `POST` | `/index` | Chunk, embed, and index text document(s) into a collection |
+| `GET` | `/retrieve` | Semantic search — `?q=...&collection_id=...&k=5` |
+| `GET` | `/collections` | List collections (filter: `?workspace_id=...`) |
+| `DELETE` | `/collections/{id}` | Delete collection and all its chunks |
+
+> File ingestion routes (`POST /index/file`, `/documents/*`) land in E10–E11.
 
 ---
 
@@ -41,19 +45,44 @@ Hive calls Engram directly over HTTP — Cortex does not proxy these calls.
 ```
 engram/
 ├── engram/
-│   ├── app.py          FastAPI app, lifespan (pool open/close), route registration
-│   ├── store.py        Async Postgres store — AsyncConnectionPool (psycopg-pool)
-│   ├── models.py       Pydantic schemas for all routes
-│   ├── embeddings.py   OpenRouter batch embedding client (up to 100 chunks per call)
-│   ├── chunker.py      Token-aware splitter — tiktoken cl100k_base, 512 tok/64 overlap
-│   └── config.py       Env-based config (DATABASE_URL, ENGRAM_PORT, OPENROUTER_API_KEY)
+│   ├── app.py                      FastAPI app + lifespan (DB init, DoclingClient startup/shutdown)
+│   ├── store.py                    Async pgvector store (psycopg3 pool)
+│   ├── models.py                   Pydantic request/response schemas
+│   ├── embeddings.py               OpenRouter batch embedding client (retry + backoff)
+│   ├── chunker.py                  Token-aware text chunking (tiktoken)
+│   ├── config.py                   All settings from env vars
+│   ├── clients/
+│   │   ├── docling.py              DoclingClient — async Docling-serve HTTP client
+│   │   └── storage/
+│   │       ├── base.py             ObjectStore ABC (put/get/exists/delete/presigned_url)
+│   │       ├── memory.py           InMemoryObjectStore (dev/test; sentinel presigned URLs)
+│   │       └── minio.py            MinioObjectStore (aioboto3, S3-compatible)
+│   └── processors/
+│       ├── base.py                 Modality + ChunkerKind enums, ChunkCandidate dataclass, Protocols
+│       ├── tiktoken_processor.py   TiktokenProcessor (sync; current default; Docling fallback)
+│       ├── docling_text.py         DoclingTextProcessor stub (E8)
+│       └── docling_file.py         DoclingFileProcessor stub (E8)
 ├── migrations/
-│   ├── 0001.create_schema.sql          engram schema + documents + chunks tables
-│   ├── 0002.add_chunk_embedding.sql    embedding vector(1536) on chunks
-│   ├── 0003.add_collections.sql        collections table
-│   └── 0004.add_chunks_hnsw_index.sql  HNSW index on chunks.embedding
+│   ├── 0001.create_collections.sql
+│   ├── 0002.create_documents_and_chunks.sql
+│   ├── 0003.add_indexes.sql
+│   ├── 0004.add_modality_and_chunker.sql    modality/chunker fields + partial HNSW WHERE modality='text'
+│   ├── 0005.create_ingest_jobs.sql          async job table with last_heartbeat
+│   └── 0006.add_document_object_storage.sql  object_key/source_mime/file_size/file_hash + SHA-256 dedup index
 ├── tests/
-│   └── test_engram_api.py   12 tests — health, index, retrieve, collections
+│   ├── unit/                       Hermetic tests, no network (53 passing, <1s)
+│   │   ├── test_storage_contract.py    ObjectStoreContract — 11 behavioral tests
+│   │   ├── test_storage_memory.py      InMemory passes contract
+│   │   ├── test_processors.py          TiktokenProcessor
+│   │   ├── test_ingest_jobs.py         Job CRUD + orphan recovery
+│   │   └── test_docling_client.py      DoclingClient (httpx-mocked, 17 tests)
+│   ├── integration/                Real-service tests (opt-in: -m integration)
+│   │   ├── fixtures/sample.{pdf,md}    Test fixtures
+│   │   ├── test_storage_minio.py       MinIO passes ObjectStoreContract
+│   │   └── test_docling_real.py        E7 gate — 7 tests against real Docling-serve
+│   └── test_routes.py              Route tests (mocked store + embeddings)
+├── compose.test.yml                MinIO (:19000) + Docling (:15001) for integration tests
+├── VERIFICATION.md                 Verified Docling-serve API shape (fill after E7 gate)
 ├── pyproject.toml
 └── .env.example
 ```
@@ -62,68 +91,84 @@ engram/
 
 ## Setup
 
-**Prerequisites:** Python 3.13, [uv](https://docs.astral.sh/uv/), PostgreSQL with pgvector (`pgvector/pgvector:pg16`)
+**Prerequisites:** Python 3.13, [uv](https://docs.astral.sh/uv/), PostgreSQL with pgvector (`pgvector/pgvector:pg16` — requires pgvector ≥ 0.7.0 for partial HNSW index)
 
 ```bash
 cd engram
 cp .env.example .env
-# Edit .env — set DATABASE_URL and OPENROUTER_API_KEY
+# Set DATABASE_URL, OPENROUTER_API_KEY
 uv sync
-uv run task dev      # starts uvicorn on port 8613 with --reload
+uv run task dev      # uvicorn on :8613 with --reload
 ```
 
 ---
 
-## Configuration (`.env`)
+## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | — | PostgreSQL connection string (required) |
-| `ENGRAM_PORT` | `8613` | Port to bind |
-| `OPENROUTER_API_KEY` | — | API key for OpenRouter embeddings (required for `/index` and `/retrieve`) |
+| `ENGRAM_PORT` | `8613` | HTTP port |
+| `OPENROUTER_API_KEY` | — | Required for `/index` and `/retrieve` |
+| `DOCLING_URL` | `http://localhost:5001` | Docling-serve base URL |
+| `DOCLING_ENABLED` | `true` | Set `false` → tiktoken fallback |
+| `DOCLING_TIMEOUT` | `120.0` | Per-request HTTP timeout (s) |
+| `DOCLING_POLL_INTERVAL` | `2.0` | Poll sleep interval (s) |
+| `DOCLING_MAX_WAIT` | `600.0` | Max wait per Docling task (s) |
+| `MINIO_ENDPOINT` | `http://localhost:9000` | MinIO endpoint |
+| `MINIO_ACCESS_KEY` | `minioadmin` | MinIO access key |
+| `MINIO_SECRET_KEY` | `minioadmin` | MinIO secret key |
+| `MINIO_BUCKET` | `engram` | MinIO bucket name |
+| `MINIO_ENABLED` | `false` | `true` → MinIO; `false` → InMemory |
+| `MAX_CONCURRENT_INGEST_JOBS` | `4` | Worker concurrency cap (E9) |
+| `MAX_FILE_SIZE_MB` | `50` | Max upload size for `/index/file` (E10) |
+| `INGEST_HEARTBEAT_STALE_SECONDS` | `60` | Heartbeat age before orphan recovery |
+| `INGEST_JOB_RETENTION_DAYS` | `7` | Retention for completed/failed jobs |
+| `DEFAULT_TEXT_CHUNKER` | `docling-hybrid` | Active chunker for `/index` (E8) |
+| `CHUNK_SIZE_TOKENS` | `512` | Tiktoken chunk size |
+| `CHUNK_OVERLAP_TOKENS` | `64` | Tiktoken overlap |
+| `EMBEDDING_BATCH_SIZE` | `100` | Max texts per embedding API call |
 
 ---
 
-## Schema
+## Database schema
 
-All tables live in the `engram` schema in the shared PostgreSQL database.
+All tables in the `engram` PostgreSQL schema. Migrations via yoyo-migrations (isolated `_engram_yoyo_*` tables).
 
 | Table | Key columns |
 |-------|-------------|
-| `engram.collections` | `id UUID`, `name`, `created_at` |
-| `engram.documents` | `id UUID`, `collection_id`, `title`, `source`, `created_at` |
-| `engram.chunks` | `id`, `document_id`, `content`, `embedding vector(1536)`, `token_count`, `chunk_index` |
+| `engram.collections` | `id`, `workspace_id`, `name`, `created_at` |
+| `engram.documents` | `id`, `collection_id`, `path`, `metadata`, `object_key`, `file_hash`, `file_size`, `source_mime` |
+| `engram.chunks` | `id`, `document_id`, `content`, `embedding vector(1536)`, `modality`, `chunker`, `chunker_version`, `media_ref` |
+| `engram.ingest_jobs` | `id`, `collection_id`, `document_id`, `status`, `filename`, `object_key`, `last_heartbeat`, `error_message` |
 
-HNSW index on `engram.chunks.embedding` for fast cosine similarity search.
+**SHA-256 dedup:** partial unique index on `(collection_id, file_hash) WHERE file_hash IS NOT NULL`. Same file submitted to the same collection is a no-op.
 
----
-
-## Chunking
-
-Documents are split with `chunker.py` before indexing:
-
-| Parameter | Value |
-|-----------|-------|
-| Tokenizer | tiktoken `cl100k_base` |
-| Chunk size | 512 tokens |
-| Overlap | 64 tokens |
-| Boundary | Line-aware (won't split mid-line unless a single line exceeds the limit) |
+**Partial HNSW index:** `WHERE modality = 'text'` — only text chunks are ANN-searched in Phase 1. Image/audio/video embeddings (Phase 2+) don't inflate search cost.
 
 ---
 
-## Embeddings
+## Chunking and processors
 
-Chunks are batch-embedded via OpenRouter `openai/text-embedding-3-small` (1536 dims, up to 100 chunks per API call). Retrieval embeds the query with the same model, then runs cosine similarity (`<=>`) against the HNSW index.
+All processors output `list[ChunkCandidate]`. Each candidate carries `content`, `chunk_index`, `modality`, `chunker`, `chunker_version`, and optional `media_ref`/`media_metadata`.
+
+| Processor | Kind | Status |
+|-----------|------|--------|
+| `TiktokenProcessor` | `tiktoken-fallback` | Active — current `/index` default |
+| `DoclingTextProcessor` | `docling-hybrid` | Stub — implemented in E8 |
+| `DoclingFileProcessor` | `docling-hybrid` | Stub — implemented in E8 |
+
+`InMemoryObjectStore` and `MinioObjectStore` share `ObjectStoreContract` (11 behavioral tests) — drift between backends is structurally impossible.
 
 ---
 
-## Connection pooling
+## Ingest job lifecycle (E9+)
 
-Engram uses `psycopg-pool AsyncConnectionPool(min_size=2, max_size=10)` opened lazily on first request and closed in the lifespan teardown. All queries go through `_run(fn)`:
-
-```python
-async with pool.connection() as conn:
-    return await fn(conn)
+```
+POST /index/file → create job (pending) → schedule worker
+worker: upload to MinIO → Docling parse → embed → store → mark completed
+         ↕ bump last_heartbeat every 10s
+startup: recover_orphan_jobs() re-queues stale processing jobs (DB now(), not app clock)
 ```
 
 ---
@@ -131,12 +176,17 @@ async with pool.connection() as conn:
 ## Development
 
 ```bash
-uv run task dev       # uvicorn --reload on port 8613
-uv run task test      # pytest -v
-uv run task lint      # ruff check .
-uv run task typecheck # mypy engram/
-uv run task fmt       # ruff format .
-uv run task check     # lint + typecheck + test
+uv run task dev       # uvicorn --reload on :8613
+uv run task test      # pytest -v (integration tests excluded by default)
+uv run task check     # ruff check + format --check + pytest
+
+# Integration tests (requires compose.test.yml)
+docker compose -f compose.test.yml up -d
+uv run pytest -m integration -v
+
+# E7 verification gate (must pass before E8)
+docker compose -f compose.test.yml up -d docling
+uv run pytest -m integration tests/integration/test_docling_real.py -v
 ```
 
 ---
@@ -148,15 +198,14 @@ uv run task check     # lint + typecheck + test
 | Web framework | FastAPI + Uvicorn |
 | Validation | Pydantic v2 |
 | Database | psycopg v3 async + psycopg-pool |
-| Migrations | yoyo-migrations (isolated `_engram_yoyo_*` tables) |
-| Vector search | pgvector (1536-dim HNSW cosine) |
+| Migrations | yoyo-migrations |
+| Vector search | pgvector ≥ 0.7.0 (partial HNSW, cosine) |
 | Tokenizer | tiktoken `cl100k_base` |
 | Embeddings | OpenRouter `openai/text-embedding-3-small` |
+| Object storage | aioboto3 / MinIO (S3-compatible) |
+| Document parsing | Docling-serve (async task API) |
+| HTTP client | httpx (async) |
 | Observability | brainstack-optics (OTel) |
-
----
-
-**Project devlog:** [andrerogers/vault — brainstack.md](https://github.com/andrerogers/vault/blob/master/projects/brainstack/brainstack.md)
 
 ---
 
