@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from engram.clients.docling import DoclingClient, DoclingTaskFailed
+from engram.clients.docling import DoclingClient
 
 pytestmark = pytest.mark.integration
 
