@@ -14,7 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from engram import embeddings
 from engram.clients.docling import DoclingClient
-from engram.config import DATABASE_URL
+from engram.config import DATABASE_URL, MAX_CONCURRENT_INGEST_JOBS
+from engram.jobs.runner import Runner
 from engram.models import (
     CollectionOut,
     DocumentIn,
@@ -28,6 +29,7 @@ from engram.store import Store
 
 _docling: DoclingClient = DoclingClient()
 _processor = get_text_processor(_docling)
+_runner: Runner = Runner(MAX_CONCURRENT_INGEST_JOBS, _docling)
 
 _store: Store | None = None
 
@@ -45,10 +47,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if DATABASE_URL:
         _store = Store(DATABASE_URL)
         await _store.init_db()
+        await _runner.startup(_store)
         log.info("engram started — store initialised")
     else:
         log.warning("engram started — no DATABASE_URL, store unavailable")
     yield
+    await _runner.shutdown_wait()
     if _store is not None:
         await _store.close()
         log.info("engram shutting down — store closed")
