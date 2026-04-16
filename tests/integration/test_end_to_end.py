@@ -144,7 +144,10 @@ async def test_dedup_second_upload_returns_existing_document(
         object_key=object_key,
     )
 
-    with patch("engram.jobs.ingest.embeddings.embed", AsyncMock(side_effect=lambda t: [_FAKE_EMBEDDING] * len(t))):
+    with patch(
+        "engram.jobs.ingest.embeddings.embed",
+        AsyncMock(side_effect=lambda t: [_FAKE_EMBEDDING] * len(t)),
+    ):
         await run_ingest_job(job_id, store, object_store, file_processor)
 
     doc_id = (await store.get_ingest_job(job_id))["document_id"]
@@ -171,7 +174,10 @@ async def test_list_and_delete_document(
         filename="sample.pdf",
         object_key=object_key,
     )
-    with patch("engram.jobs.ingest.embeddings.embed", AsyncMock(side_effect=lambda t: [_FAKE_EMBEDDING] * len(t))):
+    with patch(
+        "engram.jobs.ingest.embeddings.embed",
+        AsyncMock(side_effect=lambda t: [_FAKE_EMBEDDING] * len(t)),
+    ):
         await run_ingest_job(job_id, store, object_store, file_processor)
 
     docs = await store.list_documents(collection_id)
