@@ -166,6 +166,9 @@ async def retrieve(
     q: str = Query(..., description="Search query"),
     collection_id: str = Query(..., description="Collection to search"),
     k: int = Query(default=5, ge=1, le=100),
+    modalities: list[str] | None = Query(
+        default=None, description="Modality filter (default: text)"
+    ),
 ) -> RetrieveResponse:
     store = _get_store()
     vecs = await embeddings.embed([q])
@@ -173,6 +176,7 @@ async def retrieve(
         embedding=vecs[0],
         collection_id=collection_id,
         k=k,
+        modalities=modalities,
     )
     return RetrieveResponse(results=[RetrieveResult(**r) for r in results])
 

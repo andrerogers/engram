@@ -146,6 +146,34 @@ def test_retrieve_requires_collection_id() -> None:
     assert r.status_code == 422
 
 
+def test_retrieve_passes_modalities_to_store() -> None:
+    store = _mock_store()
+    store.retrieve = AsyncMock(return_value=[])
+    mock_embed = AsyncMock(return_value=[[0.1] * 1536])
+
+    with patch(_STORE, store), patch(_EMBED, mock_embed):
+        r = client.get(
+            "/retrieve",
+            params={"q": "test", "collection_id": "coll-1", "modalities": ["image", "text"]},
+        )
+
+    assert r.status_code == 200
+    call_kwargs = store.retrieve.call_args.kwargs
+    assert set(call_kwargs["modalities"]) == {"image", "text"}
+
+
+def test_retrieve_default_modalities_is_none() -> None:
+    store = _mock_store()
+    store.retrieve = AsyncMock(return_value=[])
+    mock_embed = AsyncMock(return_value=[[0.1] * 1536])
+
+    with patch(_STORE, store), patch(_EMBED, mock_embed):
+        client.get("/retrieve", params={"q": "test", "collection_id": "coll-1"})
+
+    call_kwargs = store.retrieve.call_args.kwargs
+    assert call_kwargs["modalities"] is None
+
+
 # ---------------------------------------------------------------------------
 # Collections
 # ---------------------------------------------------------------------------
