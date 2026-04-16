@@ -67,7 +67,9 @@ class MinioObjectStore(ObjectStore):
     async def shutdown(self) -> None:
         """No persistent connection to close — sessions are context-managed per call."""
 
-    async def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+    async def put(
+        self, key: str, data: bytes, content_type: str = "application/octet-stream"
+    ) -> None:
         async with self._make_client() as client:
             await client.put_object(
                 Bucket=self._bucket,
@@ -90,8 +92,10 @@ class MinioObjectStore(ObjectStore):
             try:
                 await client.head_object(Bucket=self._bucket, Key=key)
                 return True
-            except Exception:
-                return False
+            except client.exceptions.ClientError as exc:
+                if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                    return False
+                raise
 
     async def delete(self, key: str) -> None:
         """Delete is idempotent — S3 delete_object on a missing key is a no-op."""

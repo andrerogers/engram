@@ -22,7 +22,9 @@ class InMemoryObjectStore(ObjectStore):
     async def shutdown(self) -> None:
         """No-op — nothing to release."""
 
-    async def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+    async def put(
+        self, key: str, data: bytes, content_type: str = "application/octet-stream"
+    ) -> None:
         self._data[key] = data
         self._content_types[key] = content_type
 

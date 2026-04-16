@@ -14,4 +14,6 @@ class DoclingTextProcessor:
     """Docling-backed text processor (stub — implemented in E8)."""
 
     def process(self, text: str) -> list[ChunkCandidate]:
-        raise NotImplementedError("DoclingTextProcessor not yet implemented — use TiktokenProcessor")
+        raise NotImplementedError(
+            "DoclingTextProcessor not yet implemented — use TiktokenProcessor"
+        )

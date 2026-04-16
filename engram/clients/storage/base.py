@@ -24,7 +24,9 @@ class ObjectStore(ABC):
         """Release resources gracefully."""
 
     @abstractmethod
-    async def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
+    async def put(
+        self, key: str, data: bytes, content_type: str = "application/octet-stream"
+    ) -> None:
         """Store *data* under *key*. Overwrites if key already exists."""
 
     @abstractmethod

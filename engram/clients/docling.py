@@ -54,7 +54,9 @@ class DoclingClient:
         self.timeout = timeout if timeout is not None else DOCLING_TIMEOUT
         self.poll_interval = poll_interval if poll_interval is not None else DOCLING_POLL_INTERVAL
         self.max_wait = max_wait if max_wait is not None else DOCLING_MAX_WAIT
-        self._enabled = (enabled if enabled is not None else DOCLING_ENABLED) and bool(self.base_url)
+        self._enabled = (enabled if enabled is not None else DOCLING_ENABLED) and bool(
+            self.base_url
+        )
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -110,9 +112,7 @@ class DoclingClient:
         result = await self._await_task(task_id)
         return list(result.get("chunks") or [])
 
-    async def chunk_text_hybrid(
-        self, text: str, filename: str = "text.md"
-    ) -> list[dict[str, Any]]:
+    async def chunk_text_hybrid(self, text: str, filename: str = "text.md") -> list[dict[str, Any]]:
         """Chunk a plain-text string via the hybrid chunker (submitted as UTF-8 bytes)."""
         return await self.chunk_hybrid_file(
             file_bytes=text.encode("utf-8"),
@@ -189,14 +189,12 @@ class DoclingClient:
         """
         self._require()
         assert self._client is not None
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + self.max_wait
 
         while True:
             if loop.time() > deadline:
-                raise DoclingTaskFailed(
-                    f"Task {task_id!r} exceeded max_wait ({self.max_wait}s)"
-                )
+                raise DoclingTaskFailed(f"Task {task_id!r} exceeded max_wait ({self.max_wait}s)")
 
             status_resp = await self._client.get(
                 f"/v1/status/poll/{task_id}",

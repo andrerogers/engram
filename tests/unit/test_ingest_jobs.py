@@ -60,6 +60,8 @@ class _FakeJobStore:
             self._jobs[job_id]["document_id"] = document_id
         if error_message is not None:
             self._jobs[job_id]["error_message"] = error_message
+        elif status == "processing":
+            self._jobs[job_id]["error_message"] = None
 
     async def bump_heartbeat(self, job_id: str) -> None:
         if job_id in self._jobs:
@@ -123,7 +125,9 @@ async def test_get_missing_job_returns_none(store: _FakeJobStore) -> None:
 
 
 async def test_created_job_stores_filename(store: _FakeJobStore) -> None:
-    job_id = await store.create_ingest_job("coll-1", filename="doc.pdf", object_key="uploads/doc.pdf")
+    job_id = await store.create_ingest_job(
+        "coll-1", filename="doc.pdf", object_key="uploads/doc.pdf"
+    )
     job = await store.get_ingest_job(job_id)
     assert job is not None
     assert job["filename"] == "doc.pdf"
@@ -242,3 +246,30 @@ async def test_orphan_recovery_skips_active_jobs(store: _FakeJobStore) -> None:
     job = await store.get_ingest_job(job_id)
     assert job is not None
     assert job["status"] == "processing"
+
+
+# ---------------------------------------------------------------------------
+# update_ingest_job — field semantics
+# ---------------------------------------------------------------------------
+
+
+async def test_update_to_processing_clears_error_message(store: _FakeJobStore) -> None:
+    """Transitioning to 'processing' must clear a stale error_message from a prior failure."""
+    job_id = await store.create_ingest_job("coll-1")
+    await store.update_ingest_job(job_id, status="failed", error_message="Docling unreachable")
+    # Job is recovered → pending, then picked up again → processing
+    await store.update_ingest_job(job_id, status="pending")
+    await store.update_ingest_job(job_id, status="processing")
+    job = await store.get_ingest_job(job_id)
+    assert job is not None
+    assert job["error_message"] is None
+
+
+async def test_update_without_optional_fields_preserves_existing(store: _FakeJobStore) -> None:
+    """Passing None for document_id leaves the existing value unchanged."""
+    job_id = await store.create_ingest_job("coll-1")
+    await store.update_ingest_job(job_id, status="completed", document_id="doc-xyz")
+    await store.update_ingest_job(job_id, status="completed")  # no document_id
+    job = await store.get_ingest_job(job_id)
+    assert job is not None
+    assert job["document_id"] == "doc-xyz"

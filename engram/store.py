@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+from engram.clients.storage.base import ObjectStore
 from engram.processors.base import ChunkCandidate
 
 log = logging.getLogger(__name__)
@@ -214,14 +215,41 @@ class Store:
                 return None
             object_key: str | None = row[0]
             async with conn.transaction():
-                await conn.execute(
-                    "DELETE FROM engram.documents WHERE id = %s", (document_id,)
-                )
+                await conn.execute("DELETE FROM engram.documents WHERE id = %s", (document_id,))
             return object_key
 
         return await self._run(_do)
 
     # ── Documents + Chunks ────────────────────────────────────────────────
+
+    @staticmethod
+    async def _insert_chunks(
+        conn: Any,
+        doc_id: str,
+        candidates: list[ChunkCandidate],
+        embeddings: list[list[float]],
+    ) -> None:
+        """Insert chunk rows for *doc_id* within an open transaction."""
+        for candidate, embedding in zip(candidates, embeddings, strict=True):
+            chunk_id = str(uuid.uuid4())
+            await conn.execute(
+                "INSERT INTO engram.chunks "
+                "(id, document_id, content, chunk_index, embedding, "
+                " modality, chunker, chunker_version, media_ref, media_metadata) "
+                "VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    chunk_id,
+                    doc_id,
+                    candidate.content,
+                    candidate.chunk_index,
+                    str(embedding),
+                    candidate.modality,
+                    candidate.chunker,
+                    candidate.chunker_version,
+                    candidate.media_ref,
+                    _json.dumps(candidate.media_metadata or {}),
+                ),
+            )
 
     async def index_document(
         self,
@@ -250,26 +278,7 @@ class Store:
                     "VALUES (%s, %s, %s, %s::jsonb)",
                     (doc_id, collection_id, path, meta_json),
                 )
-                for candidate, embedding in zip(candidates, embeddings, strict=True):
-                    chunk_id = str(uuid.uuid4())
-                    await conn.execute(
-                        "INSERT INTO engram.chunks "
-                        "(id, document_id, content, chunk_index, embedding, "
-                        " modality, chunker, chunker_version, media_ref, media_metadata) "
-                        "VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb)",
-                        (
-                            chunk_id,
-                            doc_id,
-                            candidate.content,
-                            candidate.chunk_index,
-                            str(embedding),
-                            candidate.modality,
-                            candidate.chunker,
-                            candidate.chunker_version,
-                            candidate.media_ref,
-                            _json.dumps(candidate.media_metadata or {}),
-                        ),
-                    )
+                await Store._insert_chunks(conn, doc_id, candidates, embeddings)
             return doc_id, len(candidates)
 
         return await self._run(_do)
@@ -303,28 +312,18 @@ class Store:
                     "INSERT INTO engram.documents "
                     "(id, collection_id, path, metadata, object_key, source_mime, file_size, file_hash) "
                     "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s)",
-                    (doc_id, collection_id, path, meta_json, object_key, source_mime, file_size, file_hash),
+                    (
+                        doc_id,
+                        collection_id,
+                        path,
+                        meta_json,
+                        object_key,
+                        source_mime,
+                        file_size,
+                        file_hash,
+                    ),
                 )
-                for candidate, embedding in zip(candidates, embeddings, strict=True):
-                    chunk_id = str(uuid.uuid4())
-                    await conn.execute(
-                        "INSERT INTO engram.chunks "
-                        "(id, document_id, content, chunk_index, embedding, "
-                        " modality, chunker, chunker_version, media_ref, media_metadata) "
-                        "VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb)",
-                        (
-                            chunk_id,
-                            doc_id,
-                            candidate.content,
-                            candidate.chunk_index,
-                            str(embedding),
-                            candidate.modality,
-                            candidate.chunker,
-                            candidate.chunker_version,
-                            candidate.media_ref,
-                            _json.dumps(candidate.media_metadata or {}),
-                        ),
-                    )
+                await Store._insert_chunks(conn, doc_id, candidates, embeddings)
             return doc_id, len(candidates)
 
         return await self._run(_do)
@@ -388,16 +387,31 @@ class Store:
         document_id: str | None = None,
         error_message: str | None = None,
     ) -> None:
-        """Update job status (and optionally document_id / error_message)."""
+        """Update job status, and explicitly set document_id / error_message when provided.
+
+        Passing None for document_id or error_message leaves the existing value unchanged.
+        To explicitly clear a field, callers should use a direct SQL update (rare).
+        Note: error_message IS cleared when transitioning back to 'pending' (orphan recovery
+        writes its own message via recover_orphan_jobs).
+        """
 
         async def _do(conn: Any) -> None:
-            async with conn.transaction():
-                await conn.execute(
-                    "UPDATE engram.ingest_jobs SET status = %s, document_id = COALESCE(%s, document_id), "
-                    "error_message = COALESCE(%s, error_message), updated_at = now() "
-                    "WHERE id = %s",
-                    (status, document_id, error_message, job_id),
-                )
+            fields = ["status = %s", "updated_at = now()"]
+            params: list[Any] = [status]
+            if document_id is not None:
+                fields.append("document_id = %s")
+                params.append(document_id)
+            if error_message is not None:
+                fields.append("error_message = %s")
+                params.append(error_message)
+            elif status == "processing":
+                # Clear stale error message when a job starts processing
+                fields.append("error_message = NULL")
+            params.append(job_id)
+            await conn.execute(
+                f"UPDATE engram.ingest_jobs SET {', '.join(fields)} WHERE id = %s",
+                params,
+            )
 
         await self._run(_do)
 
@@ -488,21 +502,17 @@ class Store:
 
         return await self._run(_do)
 
-    async def _sweep_orphan_objects(
-        self, object_store: object, log: Any = None
-    ) -> int:
+    async def _sweep_orphan_objects(self, object_store: ObjectStore) -> int:
         """Delete object-store keys that have no matching job or document.
 
         Called on startup to clean up partial uploads from crashed workers.
         Returns the count of swept objects.
 
-        Note: This requires a concrete object_store implementation — the store
-        itself has no dependency on the ObjectStore ABC to keep the layers clean.
-        The caller (lifespan) passes the configured store.
+        Note: Full sweep requires listing object keys from MinIO and
+        cross-referencing against DB. Implemented in E9 (job runner + lifespan
+        wiring) when both stores are available.
         """
-        # Placeholder implementation — full sweep requires listing object keys
-        # from MinIO and cross-referencing against DB. This will be fleshed out
-        # in E9 (job runner + lifespan wiring) when both stores are available.
+        # Placeholder — fleshed out in E9.
         return 0
 
     async def retrieve(
