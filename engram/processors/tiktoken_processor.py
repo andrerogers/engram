@@ -13,11 +13,11 @@ from engram.processors.base import ChunkCandidate, ChunkerKind, Modality
 
 
 class TiktokenProcessor:
-    """Synchronous text processor backed by tiktoken fixed-size chunking."""
+    """Async text processor backed by tiktoken fixed-size chunking."""
 
     CHUNKER_VERSION = "tiktoken-cl100k-512"
 
-    def process(self, text: str) -> list[ChunkCandidate]:
+    async def process(self, text: str) -> list[ChunkCandidate]:
         """Split *text* into ChunkCandidates using tiktoken chunking."""
         raw_chunks = chunk_text(text)
         return [

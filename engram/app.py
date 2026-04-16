@@ -23,11 +23,11 @@ from engram.models import (
     RetrieveResponse,
     RetrieveResult,
 )
-from engram.processors.tiktoken_processor import TiktokenProcessor
+from engram.processors import get_text_processor
 from engram.store import Store
 
-_processor = TiktokenProcessor()
 _docling: DoclingClient = DoclingClient()
+_processor = get_text_processor(_docling)
 
 _store: Store | None = None
 
@@ -86,7 +86,7 @@ async def _index_documents(
     """Chunk, embed, and store documents. Returns (doc_count, chunk_count)."""
     total_chunks = 0
     for doc in documents:
-        candidates = _processor.process(doc.content)
+        candidates = await _processor.process(doc.content)
         if not candidates:
             continue
         vecs = await embeddings.embed([c.content for c in candidates])

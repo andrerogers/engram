@@ -56,7 +56,7 @@ class ChunkCandidate:
 class TextProcessor(Protocol):
     """Protocol for text-input processors."""
 
-    def process(self, text: str) -> list[ChunkCandidate]:
+    async def process(self, text: str) -> list[ChunkCandidate]:
         """Chunk *text* into candidates."""
         ...
 

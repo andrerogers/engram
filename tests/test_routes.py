@@ -26,7 +26,7 @@ def _mock_store() -> AsyncMock:
 
 
 def _mock_processor(chunks: list[str]) -> MagicMock:
-    """Return a mock processor whose process() returns ChunkCandidates."""
+    """Return a mock processor whose async process() returns ChunkCandidates."""
     candidates = [
         ChunkCandidate(
             content=c,
@@ -37,7 +37,7 @@ def _mock_processor(chunks: list[str]) -> MagicMock:
         for i, c in enumerate(chunks)
     ]
     proc = MagicMock()
-    proc.process.return_value = candidates
+    proc.process = AsyncMock(return_value=candidates)
     return proc
 
 
