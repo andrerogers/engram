@@ -181,7 +181,7 @@ class Store:
         async def _do(conn: Any) -> dict[str, Any] | None:
             row = await (
                 await conn.execute(
-                    "SELECT id, collection_id, path, metadata, created_at "
+                    "SELECT id, collection_id, path, metadata, object_key, created_at "
                     "FROM engram.documents WHERE id = %s",
                     (document_id,),
                 )
@@ -193,8 +193,28 @@ class Store:
                 "collection_id": row[1],
                 "path": row[2],
                 "metadata": row[3],
-                "created_at": row[4].isoformat(),
+                "object_key": row[4],
+                "created_at": row[5].isoformat(),
             }
+
+        return await self._run(_do)
+
+    async def find_document_by_hash(self, collection_id: str, file_hash: str) -> str | None:
+        """Return the document_id of an existing document with the same hash, or None.
+
+        Uses the partial unique index ``(collection_id, file_hash)`` from migration 0006
+        to enforce per-collection deduplication.
+        """
+
+        async def _do(conn: Any) -> str | None:
+            row = await (
+                await conn.execute(
+                    "SELECT id FROM engram.documents "
+                    "WHERE collection_id = %s AND file_hash = %s LIMIT 1",
+                    (collection_id, file_hash),
+                )
+            ).fetchone()
+            return row[0] if row else None
 
         return await self._run(_do)
 

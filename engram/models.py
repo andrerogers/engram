@@ -54,6 +54,36 @@ class RetrieveResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# File ingestion
+# ---------------------------------------------------------------------------
+
+
+class FileIngestResponse(BaseModel):
+    """Response for POST /index/file.
+
+    status="accepted"  → job_id is set, HTTP 202.
+    status="duplicate" → document_id is set (existing doc), HTTP 200.
+    """
+
+    status: str
+    job_id: str | None = None
+    document_id: str | None = None
+
+
+class IngestJobOut(BaseModel):
+    id: str
+    collection_id: str
+    status: str
+    filename: str | None = None
+    object_key: str | None = None
+    document_id: str | None = None
+    error_message: str | None = None
+    last_heartbeat: str | None = None
+    created_at: str
+    updated_at: str
+
+
+# ---------------------------------------------------------------------------
 # Collections
 # ---------------------------------------------------------------------------
 
