@@ -63,6 +63,7 @@ async def run_ingest_job(
             candidates=candidates,
             embeddings=vecs,
             object_key=object_key,
+            file_hash=job.get("file_hash"),
         )
         await store.update_ingest_job(job_id, status="completed", document_id=doc_id)
         log.info("ingest job %s completed: doc=%s chunks=%d", job_id, doc_id, chunk_count)

@@ -1,8 +1,7 @@
 """E13 — End-to-end integration test: PDF upload → ingest → retrieve.
 
-Requires all three external services running (see compose.test.yml + main docker-compose.yml):
-    docker compose -f compose.test.yml up -d minio docling
-    docker compose up -d postgres           # main stack
+Requires external services running (use main docker-compose.yml):
+    docker compose up -d postgres minio docling
     uv run pytest -m integration tests/integration/test_end_to_end.py -v
 
 Pipeline verified:
@@ -12,6 +11,7 @@ Pipeline verified:
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -26,12 +26,12 @@ from engram.store import Store
 
 pytestmark = pytest.mark.integration
 
-_DATABASE_URL = "postgresql://brainstack:brainstack@localhost:5432/brainstack"
-_MINIO_ENDPOINT = "http://localhost:19000"
-_MINIO_ACCESS_KEY = "minioadmin"
-_MINIO_SECRET_KEY = "minioadmin"
+_DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://brainstack:brainstack@localhost:5432/brainstack")
+_MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://localhost:9000")
+_MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+_MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
 _MINIO_BUCKET = "engram-e2e"
-_DOCLING_URL = "http://localhost:15001"
+_DOCLING_URL = os.environ.get("DOCLING_URL", "http://localhost:5001")
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "sample.pdf"
 
@@ -142,6 +142,7 @@ async def test_dedup_second_upload_returns_existing_document(
         collection_id=collection_id,
         filename="sample.pdf",
         object_key=object_key,
+        file_hash=file_hash,
     )
 
     with patch(
@@ -181,7 +182,8 @@ async def test_list_and_delete_document(
         await run_ingest_job(job_id, store, object_store, file_processor)
 
     docs = await store.list_documents(collection_id)
-    assert any(d["id"] == (await store.get_ingest_job(job_id))["document_id"] for d in docs)
+    job = await store.get_ingest_job(job_id)
+    assert any(d["id"] == job["document_id"] for d in docs)
 
     doc_id = (await store.get_ingest_job(job_id))["document_id"]
     returned_key = await store.delete_document(doc_id)

@@ -251,6 +251,7 @@ async def index_file(
         collection_id=cid,
         filename=filename,
         object_key=key,
+        file_hash=file_hash,
     )
     _runner.schedule(job_id, store, _object_store, _file_processor)
 

@@ -355,6 +355,7 @@ class Store:
         collection_id: str,
         filename: str | None = None,
         object_key: str | None = None,
+        file_hash: str | None = None,
     ) -> str:
         """Create a new ingest job in 'pending' state. Returns job_id."""
         job_id = str(uuid.uuid4())
@@ -363,9 +364,9 @@ class Store:
             async with conn.transaction():
                 await conn.execute(
                     "INSERT INTO engram.ingest_jobs "
-                    "(id, collection_id, filename, object_key, status) "
-                    "VALUES (%s, %s, %s, %s, 'pending')",
-                    (job_id, collection_id, filename, object_key),
+                    "(id, collection_id, filename, object_key, file_hash, status) "
+                    "VALUES (%s, %s, %s, %s, %s, 'pending')",
+                    (job_id, collection_id, filename, object_key, file_hash),
                 )
             return job_id
 
@@ -378,7 +379,7 @@ class Store:
             row = await (
                 await conn.execute(
                     "SELECT id, collection_id, document_id, status, filename, "
-                    "object_key, error_message, last_heartbeat, created_at, updated_at "
+                    "object_key, file_hash, error_message, last_heartbeat, created_at, updated_at "
                     "FROM engram.ingest_jobs WHERE id = %s",
                     (job_id,),
                 )
@@ -392,10 +393,11 @@ class Store:
                 "status": row[3],
                 "filename": row[4],
                 "object_key": row[5],
-                "error_message": row[6],
-                "last_heartbeat": row[7].isoformat() if row[7] else None,
-                "created_at": row[8].isoformat(),
-                "updated_at": row[9].isoformat(),
+                "file_hash": row[6],
+                "error_message": row[7],
+                "last_heartbeat": row[8].isoformat() if row[8] else None,
+                "created_at": row[9].isoformat(),
+                "updated_at": row[10].isoformat(),
             }
 
         return await self._run(_do)
