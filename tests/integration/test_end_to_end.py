@@ -26,7 +26,9 @@ from engram.store import Store
 
 pytestmark = pytest.mark.integration
 
-_DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://brainstack:brainstack@localhost:5432/brainstack")
+_DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://brainstack:brainstack@localhost:5432/brainstack"
+)
 _MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://localhost:9000")
 _MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
 _MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
