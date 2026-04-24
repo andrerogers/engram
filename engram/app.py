@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 log = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
@@ -208,13 +208,13 @@ def _object_key(collection_id: str, file_hash: str, filename: str) -> str:
     return f"uploads/{collection_id}/{file_hash[:12]}-{filename}"
 
 
-@app.post("/index/file")
+@app.post("/index/file", response_model=None)
 async def index_file(
     file: UploadFile,
     collection_id: str | None = Query(default=None),
     workspace_id: str | None = Query(default=None),
     collection_name: str | None = Query(default=None),
-) -> FileIngestResponse:
+) -> FileIngestResponse | Response:
     """Upload a binary file for async ingestion.
 
     Returns 202 (accepted) with job_id on new files.
@@ -256,8 +256,6 @@ async def index_file(
     _runner.schedule(job_id, store, _object_store, _file_processor)
 
     log.info("index_file: accepted job=%s collection=%s file=%s", job_id, cid, filename)
-    from fastapi.responses import JSONResponse
-
     return JSONResponse(
         status_code=202,
         content=FileIngestResponse(status="accepted", job_id=job_id).model_dump(),
@@ -320,7 +318,7 @@ async def document_original(document_id: str) -> RedirectResponse:
 
 
 @app.get("/documents/_object/{key:path}")
-async def document_object_passthrough(key: str) -> bytes:
+async def document_object_passthrough(key: str) -> Response:
     """Read-through route for InMemory object store (config-gated — not for MinIO).
 
     Returns raw bytes with status 200.  Disabled when MINIO_ENABLED=True —
@@ -335,6 +333,4 @@ async def document_object_passthrough(key: str) -> bytes:
         data = await _object_store.get(key)
     except KeyError:
         raise HTTPException(status_code=404, detail="Object not found") from None
-    from fastapi.responses import Response
-
     return Response(content=data, media_type="application/octet-stream")

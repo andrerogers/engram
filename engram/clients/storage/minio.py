@@ -11,6 +11,7 @@ startup() creates the bucket if it does not exist (idempotent under concurrent r
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from engram.clients.storage.base import ObjectStore
 
@@ -34,11 +35,11 @@ class MinioObjectStore(ObjectStore):
         self._access_key = access_key
         self._secret_key = secret_key
         self._bucket = bucket
-        self._client: object | None = None
-        self._session: object | None = None
+        self._client: Any = None
+        self._session: Any = None
 
-    def _make_client(self) -> object:
-        import aioboto3  # type: ignore[import]
+    def _make_client(self) -> Any:
+        import aioboto3
 
         session = aioboto3.Session(
             aws_access_key_id=self._access_key,
@@ -83,7 +84,7 @@ class MinioObjectStore(ObjectStore):
             try:
                 response = await client.get_object(Bucket=self._bucket, Key=key)
                 body = response["Body"]
-                return await body.read()
+                return bytes(await body.read())
             except client.exceptions.NoSuchKey:
                 raise KeyError(f"Object not found: {key!r}") from None
 
