@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 log = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from engram import embeddings
 from engram.clients.docling import DoclingClient
@@ -39,6 +40,33 @@ from engram.models import (
     RetrieveResponse,
     RetrieveResult,
 )
+
+
+class FactIn(BaseModel):
+    id: str | None = None
+    workspace_id: str
+    content: str
+    tags: list[str] = []
+    source: str | None = None
+
+
+class FactOut(BaseModel):
+    id: str
+    content: str
+    tags: list[str]
+    source: str | None
+    created_at: str | None
+    score: float = 0.0
+
+
+class SignalIn(BaseModel):
+    id: str | None = None
+    workspace_id: str
+    session_id: str | None = None
+    signal_type: str
+    content: str
+
+
 from engram.processors import get_file_processor, get_text_processor
 from engram.store import Store
 
@@ -334,3 +362,103 @@ async def document_object_passthrough(key: str) -> Response:
     except KeyError:
         raise HTTPException(status_code=404, detail="Object not found") from None
     return Response(content=data, media_type="application/octet-stream")
+
+
+# ── Facts ─────────────────────────────────────────────────────────────────
+
+
+@app.post("/facts", status_code=201)
+async def store_fact(req: FactIn) -> dict[str, str]:
+    """Store a distilled fact with an embedding. Returns the fact ID."""
+    store = _get_store()
+    import uuid as _uuid
+
+    fact_id = req.id or str(_uuid.uuid4())
+    embedding: list[float] | None = None
+    try:
+        vecs = await embeddings.embed([req.content])
+        embedding = vecs[0]
+    except Exception as exc:
+        log.warning("store_fact: embedding failed — storing without vector (%s)", exc)
+    await store.upsert_fact(
+        fact_id=fact_id,
+        workspace_id=req.workspace_id,
+        content=req.content,
+        tags=req.tags,
+        source=req.source,
+        embedding=embedding,
+    )
+    return {"id": fact_id}
+
+
+@app.get("/facts/recall", response_model=list[FactOut])
+async def recall_facts(
+    workspace_id: str = Query(...),
+    q: str = Query(..., description="Query text for semantic search"),
+    k: int = Query(default=5, ge=1, le=50),
+) -> list[FactOut]:
+    """Recall the top-k distilled facts semantically nearest to query."""
+    store = _get_store()
+    try:
+        vecs = await embeddings.embed([q])
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
+    rows = await store.recall_facts(workspace_id=workspace_id, embedding=vecs[0], k=k)
+    return [FactOut(**r) for r in rows]
+
+
+@app.delete("/facts/{fact_id}", status_code=204)
+async def delete_fact(fact_id: str) -> None:
+    """Delete a distilled fact by ID."""
+    store = _get_store()
+    deleted = await store.delete_fact(fact_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Fact not found")
+
+
+# ── Signals ───────────────────────────────────────────────────────────────
+
+
+@app.post("/signals", status_code=201)
+async def record_signal(req: SignalIn) -> dict[str, str]:
+    """Record an outcome quality signal with an embedding. Returns the signal ID."""
+    store = _get_store()
+    import uuid as _uuid
+
+    signal_id = req.id or str(_uuid.uuid4())
+    embedding: list[float] | None = None
+    try:
+        vecs = await embeddings.embed([req.content])
+        embedding = vecs[0]
+    except Exception as exc:
+        log.warning("record_signal: embedding failed — storing without vector (%s)", exc)
+    await store.record_signal(
+        signal_id=signal_id,
+        workspace_id=req.workspace_id,
+        session_id=req.session_id,
+        signal_type=req.signal_type,
+        content=req.content,
+        embedding=embedding,
+    )
+    return {"id": signal_id}
+
+
+@app.get("/signals/recall", response_model=list[dict[str, object]])
+async def recall_signals(
+    workspace_id: str = Query(...),
+    q: str = Query(..., description="Query text for semantic search"),
+    k: int = Query(default=5, ge=1, le=50),
+    signal_type: str | None = Query(default=None),
+) -> list[dict[str, object]]:
+    """Recall the top-k signals semantically nearest to query."""
+    store = _get_store()
+    try:
+        vecs = await embeddings.embed([q])
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
+    return await store.recall_signals(
+        workspace_id=workspace_id,
+        embedding=vecs[0],
+        k=k,
+        signal_type=signal_type,
+    )

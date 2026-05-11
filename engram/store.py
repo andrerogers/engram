@@ -537,6 +537,161 @@ class Store:
         # Placeholder — fleshed out in E9.
         return 0
 
+    # ── Facts ─────────────────────────────────────────────────────────────
+
+    async def upsert_fact(  # noqa: PLR0913
+        self,
+        fact_id: str,
+        workspace_id: str,
+        content: str,
+        tags: list[str],
+        source: str | None,
+        embedding: list[float] | None,
+    ) -> None:
+        """Insert or update a distilled fact."""
+
+        async def _do(conn: Any) -> None:
+            emb = _json.dumps(embedding) if embedding is not None else None
+            await conn.execute(
+                """
+                INSERT INTO engram.facts (id, workspace_id, content, tags, source, embedding, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s::vector, now())
+                ON CONFLICT (id) DO UPDATE
+                  SET content = EXCLUDED.content,
+                      tags = EXCLUDED.tags,
+                      source = EXCLUDED.source,
+                      embedding = EXCLUDED.embedding,
+                      updated_at = now()
+                """,
+                (fact_id, workspace_id, content, tags, source, emb),
+            )
+
+        await self._run(_do)
+
+    async def recall_facts(
+        self,
+        workspace_id: str,
+        embedding: list[float],
+        k: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return the top-k facts nearest to *embedding* for the given workspace."""
+
+        async def _do(conn: Any) -> list[dict[str, Any]]:
+            emb = _json.dumps(embedding)
+            cur = await conn.execute(
+                """
+                SELECT id, content, tags, source, created_at,
+                       1 - (embedding <=> %s::vector) AS score
+                FROM engram.facts
+                WHERE workspace_id = %s AND embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (emb, workspace_id, emb, k),
+            )
+            rows = await cur.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "content": r[1],
+                    "tags": r[2] or [],
+                    "source": r[3],
+                    "created_at": r[4].isoformat() if r[4] else None,
+                    "score": float(r[5]) if r[5] is not None else 0.0,
+                }
+                for r in rows
+            ]
+
+        return await self._run(_do)
+
+    async def delete_fact(self, fact_id: str) -> bool:
+        """Delete a fact by ID. Returns True if deleted."""
+
+        async def _do(conn: Any) -> bool:
+            result = await conn.execute(
+                "DELETE FROM engram.facts WHERE id = %s", (fact_id,)
+            )
+            return int(result.rowcount) > 0
+
+        return await self._run(_do)
+
+    # ── Signals ───────────────────────────────────────────────────────────
+
+    async def record_signal(  # noqa: PLR0913
+        self,
+        signal_id: str,
+        workspace_id: str,
+        session_id: str | None,
+        signal_type: str,
+        content: str,
+        embedding: list[float] | None,
+    ) -> None:
+        """Record an outcome quality signal."""
+
+        async def _do(conn: Any) -> None:
+            emb = _json.dumps(embedding) if embedding is not None else None
+            await conn.execute(
+                """
+                INSERT INTO engram.signals
+                    (id, workspace_id, session_id, signal_type, content, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s::vector)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (signal_id, workspace_id, session_id, signal_type, content, emb),
+            )
+
+        await self._run(_do)
+
+    async def recall_signals(
+        self,
+        workspace_id: str,
+        embedding: list[float],
+        k: int = 5,
+        signal_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the top-k signals nearest to *embedding*."""
+
+        async def _do(conn: Any) -> list[dict[str, Any]]:
+            emb = _json.dumps(embedding)
+            if signal_type:
+                cur = await conn.execute(
+                    """
+                    SELECT id, session_id, signal_type, content, created_at,
+                           1 - (embedding <=> %s::vector) AS score
+                    FROM engram.signals
+                    WHERE workspace_id = %s AND signal_type = %s AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (emb, workspace_id, signal_type, emb, k),
+                )
+            else:
+                cur = await conn.execute(
+                    """
+                    SELECT id, session_id, signal_type, content, created_at,
+                           1 - (embedding <=> %s::vector) AS score
+                    FROM engram.signals
+                    WHERE workspace_id = %s AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (emb, workspace_id, emb, k),
+                )
+            rows = await cur.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "session_id": r[1],
+                    "signal_type": r[2],
+                    "content": r[3],
+                    "created_at": r[4].isoformat() if r[4] else None,
+                    "score": float(r[5]) if r[5] is not None else 0.0,
+                }
+                for r in rows
+            ]
+
+        return await self._run(_do)
+
     async def retrieve(
         self,
         embedding: list[float],
