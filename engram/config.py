@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
+DATABASE_URL: str = os.environ.get("ENGRAM_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
 ENGRAM_PORT: int = int(os.environ.get("ENGRAM_PORT", "8613"))
 OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_EMBEDDINGS_URL: str = "https://openrouter.ai/api/v1/embeddings"
