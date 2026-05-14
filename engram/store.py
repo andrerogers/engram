@@ -608,9 +608,7 @@ class Store:
         """Delete a fact by ID. Returns True if deleted."""
 
         async def _do(conn: Any) -> bool:
-            result = await conn.execute(
-                "DELETE FROM engram.facts WHERE id = %s", (fact_id,)
-            )
+            result = await conn.execute("DELETE FROM engram.facts WHERE id = %s", (fact_id,))
             return int(result.rowcount) > 0
 
         return await self._run(_do)
