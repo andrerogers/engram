@@ -59,6 +59,8 @@ python-preference = "only-managed"
 [tool.taskipy.tasks]
 dev      = "uvicorn engram.app:app --reload --port 8613"
 test     = "pytest -v -s"
+integration = "pytest -v -s -m integration"
+test-all = "pytest -v -s -m ''"
 lint     = "ruff check ."
 typecheck = "mypy engram"
 fmt      = "ruff format ."
