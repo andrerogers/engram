@@ -1,89 +1,194 @@
-"""Async PostgreSQL store for Engram — collections, documents, chunks with vectors.
+"""SQLite store for Engram — collections, documents, chunks, ingest jobs, facts, signals.
 
-Uses psycopg3 async with a connection pool (psycopg-pool). Schema: 'engram'.
-The pool handles reconnection automatically.
+One file (``ENGRAM_DB_PATH``, default ``~/.brainstack/engram.db``), opened lazily with the
+sqlite-vec extension loaded. Embeddings live in vec0 tables behind ``engram.vector_store``;
+triggers remove a row's vector when the row is deleted, including by cascade. One connection is
+shared behind a lock and every public method hops to a worker thread.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json as _json
+import json
 import logging
+import sqlite3
+import threading
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
+import sqlite_vec
+
 from engram.clients.storage.base import ObjectStore
 from engram.processors.base import ChunkCandidate
+from engram.vector_store import CHUNKS, FACTS, SIGNALS
 
 log = logging.getLogger(__name__)
-
-_MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
 
 _T = TypeVar("_T")
 
 
+def _migrations(dimensions: int) -> tuple[str, ...]:
+    """Ordered schema versions, tracked with PRAGMA user_version. Never edit a shipped entry."""
+    return (
+        f"""
+        CREATE TABLE collections (
+            id           TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            name         TEXT NOT NULL,
+            created_at   TEXT NOT NULL,
+            UNIQUE (workspace_id, name)
+        );
+        CREATE TABLE documents (
+            id            TEXT PRIMARY KEY,
+            collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+            path          TEXT,
+            metadata      TEXT NOT NULL DEFAULT '{{}}',
+            object_key    TEXT,
+            source_mime   TEXT,
+            file_size     INTEGER,
+            file_hash     TEXT,
+            created_at    TEXT NOT NULL
+        );
+        CREATE INDEX documents_collection ON documents (collection_id);
+        CREATE UNIQUE INDEX documents_collection_hash
+            ON documents (collection_id, file_hash) WHERE file_hash IS NOT NULL;
+        CREATE TABLE chunks (
+            id              TEXT PRIMARY KEY,
+            document_id     TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            content         TEXT NOT NULL,
+            chunk_index     INTEGER NOT NULL,
+            modality        TEXT NOT NULL DEFAULT 'text'
+                CHECK (modality IN ('text', 'image', 'audio', 'video')),
+            chunker         TEXT NOT NULL DEFAULT 'tiktoken-fallback',
+            chunker_version TEXT,
+            media_ref       TEXT,
+            media_metadata  TEXT NOT NULL DEFAULT '{{}}',
+            created_at      TEXT NOT NULL
+        );
+        CREATE INDEX chunks_document ON chunks (document_id);
+        CREATE TABLE ingest_jobs (
+            id             TEXT PRIMARY KEY,
+            collection_id  TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+            document_id    TEXT REFERENCES documents(id) ON DELETE SET NULL,
+            status         TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+            filename       TEXT,
+            object_key     TEXT,
+            file_hash      TEXT,
+            error_message  TEXT,
+            last_heartbeat TEXT,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+        CREATE INDEX ingest_jobs_collection ON ingest_jobs (collection_id);
+        CREATE INDEX ingest_jobs_status ON ingest_jobs (status);
+        CREATE TABLE facts (
+            id           TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            content      TEXT NOT NULL,
+            tags         TEXT NOT NULL DEFAULT '[]',
+            source       TEXT,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
+        );
+        CREATE INDEX facts_workspace ON facts (workspace_id);
+        CREATE TABLE signals (
+            id           TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            session_id   TEXT,
+            signal_type  TEXT NOT NULL,
+            content      TEXT NOT NULL,
+            created_at   TEXT NOT NULL
+        );
+        CREATE INDEX signals_workspace ON signals (workspace_id);
+        {CHUNKS.ddl(dimensions)}
+        {FACTS.ddl(dimensions)}
+        {SIGNALS.ddl(dimensions)}
+        CREATE TRIGGER chunks_drop_vector AFTER DELETE ON chunks
+            BEGIN DELETE FROM chunk_vectors WHERE chunk_id = old.id; END;
+        CREATE TRIGGER facts_drop_vector AFTER DELETE ON facts
+            BEGIN DELETE FROM fact_vectors WHERE fact_id = old.id; END;
+        CREATE TRIGGER signals_drop_vector AFTER DELETE ON signals
+            BEGIN DELETE FROM signal_vectors WHERE signal_id = old.id; END;
+        """,
+    )
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _job(row: tuple[Any, ...], with_hash: bool) -> dict[str, Any]:
+    job = {
+        "id": row[0],
+        "collection_id": row[1],
+        "document_id": row[2],
+        "status": row[3],
+        "filename": row[4],
+        "object_key": row[5],
+    }
+    rest = list(row[6:])
+    if with_hash:
+        job["file_hash"] = rest.pop(0)
+    job["error_message"], job["last_heartbeat"], job["created_at"], job["updated_at"] = rest
+    return job
+
+
 class Store:
-    """Async Postgres store for the Engram service."""
+    """SQLite store for the Engram service."""
 
-    def __init__(self, dsn: str) -> None:
-        self._dsn = dsn
-        self._pool: Any = None
-        self._pool_lock = asyncio.Lock()
+    def __init__(self, path: Path, dimensions: int = 1536) -> None:
+        self._path = path
+        self._dimensions = dimensions
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
 
-    async def _get_pool(self) -> Any:
-        if self._pool is not None:
-            return self._pool
-        async with self._pool_lock:
-            if self._pool is None:
-                from psycopg_pool import AsyncConnectionPool
+    def _connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(
+                self._path, check_same_thread=False, timeout=5.0, isolation_level=None
+            )
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            migrations = _migrations(self._dimensions)
+            for number, script in enumerate(migrations[version:], start=version + 1):
+                conn.executescript(f"BEGIN; {script}; PRAGMA user_version = {number}; COMMIT;")
+            self._conn = conn
+        return self._conn
 
-                log.info("engram: opening PostgreSQL connection pool")
-                pool = AsyncConnectionPool(
-                    self._dsn,
-                    min_size=2,
-                    max_size=10,
-                    open=False,
-                    kwargs={"autocommit": True},
-                )
-                await pool.open()
-                self._pool = pool
-        return self._pool
+    def _execute(self, fn: Callable[[sqlite3.Connection], _T]) -> _T:
+        with self._lock:
+            conn = self._connection()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = fn(conn)
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+            return result
 
-    async def _run(self, fn: Callable[[Any], Awaitable[_T]]) -> _T:
-        """Call fn(conn) with a connection from the pool."""
-        pool = await self._get_pool()
-        async with pool.connection() as conn:
-            return await fn(conn)
+    async def _run(self, fn: Callable[[sqlite3.Connection], _T]) -> _T:
+        return await asyncio.to_thread(self._execute, fn)
 
     async def close(self) -> None:
-        """Shut down the connection pool."""
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
     async def init_db(self) -> None:
-        """Run yoyo migrations in a thread executor."""
-        dsn = self._dsn
-        migrations_dir = str(_MIGRATIONS_DIR)
-
-        def _migrate() -> None:
-            from yoyo import get_backend, read_migrations
-
-            yoyo_dsn = dsn.replace("postgresql://", "postgresql+psycopg://", 1)
-            backend = get_backend(yoyo_dsn, migration_table="_engram_yoyo_migrations")
-            # Isolate log + version tables per-service so they don't collide
-            # when Hive/Mneme/Engram share the same Postgres database.
-            backend.log_table = "_engram_yoyo_log"
-            backend.version_table = "_engram_yoyo_version"
-            migrations = read_migrations(migrations_dir)
-            with backend.lock():
-                backend.apply_migrations(backend.to_apply(migrations))
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _migrate)
-        log.info("engram: migrations applied")
+        """Open engram.db and apply migrations."""
+        await self._run(lambda c: None)
+        log.info("engram: store ready at %s", self._path)
 
     # ── Collections ───────────────────────────────────────────────────────
 
@@ -92,83 +197,60 @@ class Store:
     ) -> str:
         cid = collection_id or str(uuid.uuid4())
 
-        async def _do(conn: Any) -> str:
-            row = await (
-                await conn.execute(
-                    "SELECT id FROM engram.collections WHERE workspace_id = %s AND name = %s",
-                    (workspace_id, name),
-                )
+        def _do(c: sqlite3.Connection) -> str:
+            row = c.execute(
+                "SELECT id FROM collections WHERE workspace_id = ? AND name = ?",
+                (workspace_id, name),
             ).fetchone()
             if row:
                 return str(row[0])
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO engram.collections (id, workspace_id, name) VALUES (%s, %s, %s)",
-                    (cid, workspace_id, name),
-                )
+            c.execute(
+                "INSERT INTO collections (id, workspace_id, name, created_at) VALUES (?, ?, ?, ?)",
+                (cid, workspace_id, name, _now()),
+            )
             return cid
 
         return await self._run(_do)
 
     async def list_collections(self, workspace_id: str | None = None) -> list[dict[str, Any]]:
-        async def _do(conn: Any) -> list[dict[str, Any]]:
+        def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
+            sql = "SELECT id, workspace_id, name, created_at FROM collections"
+            params: tuple[str, ...] = ()
             if workspace_id:
-                rows = await (
-                    await conn.execute(
-                        "SELECT id, workspace_id, name, created_at FROM engram.collections "
-                        "WHERE workspace_id = %s ORDER BY created_at DESC",
-                        (workspace_id,),
-                    )
-                ).fetchall()
-            else:
-                rows = await (
-                    await conn.execute(
-                        "SELECT id, workspace_id, name, created_at FROM engram.collections "
-                        "ORDER BY created_at DESC",
-                    )
-                ).fetchall()
+                sql += " WHERE workspace_id = ?"
+                params = (workspace_id,)
+            rows = c.execute(sql + " ORDER BY created_at DESC", params).fetchall()
             return [
-                {
-                    "id": r[0],
-                    "workspace_id": r[1],
-                    "name": r[2],
-                    "created_at": r[3].isoformat(),
-                }
-                for r in rows
+                {"id": r[0], "workspace_id": r[1], "name": r[2], "created_at": r[3]} for r in rows
             ]
 
         return await self._run(_do)
 
     async def delete_collection(self, collection_id: str) -> bool:
-        async def _do(conn: Any) -> bool:
-            async with conn.transaction():
-                result = await conn.execute(
-                    "DELETE FROM engram.collections WHERE id = %s", (collection_id,)
-                )
-            return bool(result.rowcount > 0)
-
-        return await self._run(_do)
+        return await self._run(
+            lambda c: (
+                c.execute("DELETE FROM collections WHERE id = ?", (collection_id,)).rowcount > 0
+            )
+        )
 
     # ── Documents ─────────────────────────────────────────────────────────
 
     async def list_documents(self, collection_id: str) -> list[dict[str, Any]]:
         """Return all documents in a collection (no chunk data)."""
 
-        async def _do(conn: Any) -> list[dict[str, Any]]:
-            rows = await (
-                await conn.execute(
-                    "SELECT id, collection_id, path, metadata, created_at "
-                    "FROM engram.documents WHERE collection_id = %s ORDER BY created_at DESC",
-                    (collection_id,),
-                )
+        def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = c.execute(
+                "SELECT id, collection_id, path, metadata, created_at FROM documents "
+                "WHERE collection_id = ? ORDER BY created_at DESC",
+                (collection_id,),
             ).fetchall()
             return [
                 {
                     "id": r[0],
                     "collection_id": r[1],
                     "path": r[2],
-                    "metadata": r[3],
-                    "created_at": r[4].isoformat(),
+                    "metadata": json.loads(r[3]),
+                    "created_at": r[4],
                 }
                 for r in rows
             ]
@@ -178,13 +260,11 @@ class Store:
     async def get_document(self, document_id: str) -> dict[str, Any] | None:
         """Return a single document by ID, or None if not found."""
 
-        async def _do(conn: Any) -> dict[str, Any] | None:
-            row = await (
-                await conn.execute(
-                    "SELECT id, collection_id, path, metadata, object_key, created_at "
-                    "FROM engram.documents WHERE id = %s",
-                    (document_id,),
-                )
+        def _do(c: sqlite3.Connection) -> dict[str, Any] | None:
+            row = c.execute(
+                "SELECT id, collection_id, path, metadata, object_key, created_at "
+                "FROM documents WHERE id = ?",
+                (document_id,),
             ).fetchone()
             if row is None:
                 return None
@@ -192,29 +272,22 @@ class Store:
                 "id": row[0],
                 "collection_id": row[1],
                 "path": row[2],
-                "metadata": row[3],
+                "metadata": json.loads(row[3]),
                 "object_key": row[4],
-                "created_at": row[5].isoformat(),
+                "created_at": row[5],
             }
 
         return await self._run(_do)
 
     async def find_document_by_hash(self, collection_id: str, file_hash: str) -> str | None:
-        """Return the document_id of an existing document with the same hash, or None.
+        """Return the id of a document with the same hash in this collection, or None."""
 
-        Uses the partial unique index ``(collection_id, file_hash)`` from migration 0006
-        to enforce per-collection deduplication.
-        """
-
-        async def _do(conn: Any) -> str | None:
-            row = await (
-                await conn.execute(
-                    "SELECT id FROM engram.documents "
-                    "WHERE collection_id = %s AND file_hash = %s LIMIT 1",
-                    (collection_id, file_hash),
-                )
+        def _do(c: sqlite3.Connection) -> str | None:
+            row = c.execute(
+                "SELECT id FROM documents WHERE collection_id = ? AND file_hash = ? LIMIT 1",
+                (collection_id, file_hash),
             ).fetchone()
-            return row[0] if row else None
+            return str(row[0]) if row else None
 
         return await self._run(_do)
 
@@ -224,52 +297,45 @@ class Store:
         Returns None if the document does not exist.
         """
 
-        async def _do(conn: Any) -> str | None:
-            row = await (
-                await conn.execute(
-                    "SELECT object_key FROM engram.documents WHERE id = %s",
-                    (document_id,),
-                )
+        def _do(c: sqlite3.Connection) -> str | None:
+            row = c.execute(
+                "DELETE FROM documents WHERE id = ? RETURNING object_key", (document_id,)
             ).fetchone()
-            if row is None:
-                return None
-            object_key: str | None = row[0]
-            async with conn.transaction():
-                await conn.execute("DELETE FROM engram.documents WHERE id = %s", (document_id,))
-            return object_key
+            return row[0] if row else None
 
         return await self._run(_do)
 
     # ── Documents + Chunks ────────────────────────────────────────────────
 
     @staticmethod
-    async def _insert_chunks(
-        conn: Any,
+    def _insert_chunks(
+        c: sqlite3.Connection,
         doc_id: str,
+        collection_id: str,
         candidates: list[ChunkCandidate],
         embeddings: list[list[float]],
     ) -> None:
-        """Insert chunk rows for *doc_id* within an open transaction."""
+        now = _now()
         for candidate, embedding in zip(candidates, embeddings, strict=True):
             chunk_id = str(uuid.uuid4())
-            await conn.execute(
-                "INSERT INTO engram.chunks "
-                "(id, document_id, content, chunk_index, embedding, "
-                " modality, chunker, chunker_version, media_ref, media_metadata) "
-                "VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s::jsonb)",
+            c.execute(
+                "INSERT INTO chunks (id, document_id, content, chunk_index, modality, chunker, "
+                "chunker_version, media_ref, media_metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     chunk_id,
                     doc_id,
                     candidate.content,
                     candidate.chunk_index,
-                    str(embedding),
                     candidate.modality,
                     candidate.chunker,
                     candidate.chunker_version,
                     candidate.media_ref,
-                    _json.dumps(candidate.media_metadata or {}),
+                    json.dumps(candidate.media_metadata or {}),
+                    now,
                 ),
             )
+            CHUNKS.upsert(c, chunk_id, collection_id, embedding, {"modality": candidate.modality})
 
     async def index_document(
         self,
@@ -279,29 +345,10 @@ class Store:
         candidates: list[ChunkCandidate],
         embeddings: list[list[float]],
     ) -> tuple[str, int]:
-        """Store a document and its chunks with embeddings.
-
-        Args:
-            candidates: ChunkCandidate list from a processor (carries modality/chunker metadata).
-            embeddings: Per-candidate embedding vectors (must match len(candidates)).
-
-        Returns:
-            (document_id, chunk_count)
-        """
-        doc_id = str(uuid.uuid4())
-        meta_json = _json.dumps(metadata or {})
-
-        async def _do(conn: Any) -> tuple[str, int]:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO engram.documents (id, collection_id, path, metadata) "
-                    "VALUES (%s, %s, %s, %s::jsonb)",
-                    (doc_id, collection_id, path, meta_json),
-                )
-                await Store._insert_chunks(conn, doc_id, candidates, embeddings)
-            return doc_id, len(candidates)
-
-        return await self._run(_do)
+        """Store a document and its chunks with embeddings. Returns (document_id, chunk_count)."""
+        return await self.insert_document_with_chunks(
+            collection_id, path, metadata, candidates, embeddings
+        )
 
     async def insert_document_with_chunks(  # noqa: PLR0913
         self,
@@ -315,35 +362,30 @@ class Store:
         file_size: int | None = None,
         file_hash: str | None = None,
     ) -> tuple[str, int]:
-        """Store a document (with optional object-store fields) and its chunks.
-
-        Used by the async ingest job runner (E9) where files have already been
-        uploaded to MinIO before chunking begins.
+        """Store a document (with optional object-store fields) and its chunks, atomically.
 
         Returns:
             (document_id, chunk_count)
         """
         doc_id = str(uuid.uuid4())
-        meta_json = _json.dumps(metadata or {})
 
-        async def _do(conn: Any) -> tuple[str, int]:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO engram.documents "
-                    "(id, collection_id, path, metadata, object_key, source_mime, file_size, file_hash) "
-                    "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s)",
-                    (
-                        doc_id,
-                        collection_id,
-                        path,
-                        meta_json,
-                        object_key,
-                        source_mime,
-                        file_size,
-                        file_hash,
-                    ),
-                )
-                await Store._insert_chunks(conn, doc_id, candidates, embeddings)
+        def _do(c: sqlite3.Connection) -> tuple[str, int]:
+            c.execute(
+                "INSERT INTO documents (id, collection_id, path, metadata, object_key, "
+                "source_mime, file_size, file_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    doc_id,
+                    collection_id,
+                    path,
+                    json.dumps(metadata or {}),
+                    object_key,
+                    source_mime,
+                    file_size,
+                    file_hash,
+                    _now(),
+                ),
+            )
+            Store._insert_chunks(c, doc_id, collection_id, candidates, embeddings)
             return doc_id, len(candidates)
 
         return await self._run(_do)
@@ -359,46 +401,27 @@ class Store:
     ) -> str:
         """Create a new ingest job in 'pending' state. Returns job_id."""
         job_id = str(uuid.uuid4())
-
-        async def _do(conn: Any) -> str:
-            async with conn.transaction():
-                await conn.execute(
-                    "INSERT INTO engram.ingest_jobs "
-                    "(id, collection_id, filename, object_key, file_hash, status) "
-                    "VALUES (%s, %s, %s, %s, %s, 'pending')",
-                    (job_id, collection_id, filename, object_key, file_hash),
-                )
-            return job_id
-
-        return await self._run(_do)
+        now = _now()
+        await self._run(
+            lambda c: c.execute(
+                "INSERT INTO ingest_jobs (id, collection_id, filename, object_key, file_hash, "
+                "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (job_id, collection_id, filename, object_key, file_hash, now, now),
+            )
+        )
+        return job_id
 
     async def get_ingest_job(self, job_id: str) -> dict[str, Any] | None:
         """Return a job row or None."""
 
-        async def _do(conn: Any) -> dict[str, Any] | None:
-            row = await (
-                await conn.execute(
-                    "SELECT id, collection_id, document_id, status, filename, "
-                    "object_key, file_hash, error_message, last_heartbeat, created_at, updated_at "
-                    "FROM engram.ingest_jobs WHERE id = %s",
-                    (job_id,),
-                )
+        def _do(c: sqlite3.Connection) -> dict[str, Any] | None:
+            row = c.execute(
+                "SELECT id, collection_id, document_id, status, filename, object_key, file_hash, "
+                "error_message, last_heartbeat, created_at, updated_at "
+                "FROM ingest_jobs WHERE id = ?",
+                (job_id,),
             ).fetchone()
-            if row is None:
-                return None
-            return {
-                "id": row[0],
-                "collection_id": row[1],
-                "document_id": row[2],
-                "status": row[3],
-                "filename": row[4],
-                "object_key": row[5],
-                "file_hash": row[6],
-                "error_message": row[7],
-                "last_heartbeat": row[8].isoformat() if row[8] else None,
-                "created_at": row[9].isoformat(),
-                "updated_at": row[10].isoformat(),
-            }
+            return _job(row, with_hash=True) if row else None
 
         return await self._run(_do)
 
@@ -409,132 +432,101 @@ class Store:
         document_id: str | None = None,
         error_message: str | None = None,
     ) -> None:
-        """Update job status, and explicitly set document_id / error_message when provided.
+        """Update job status, and set document_id / error_message when provided.
 
-        Passing None for document_id or error_message leaves the existing value unchanged.
-        To explicitly clear a field, callers should use a direct SQL update (rare).
-        Note: error_message IS cleared when transitioning back to 'pending' (orphan recovery
-        writes its own message via recover_orphan_jobs).
+        Passing None for document_id or error_message leaves the existing value unchanged,
+        except that a transition to 'processing' clears a stale error_message.
         """
-
-        async def _do(conn: Any) -> None:
-            fields = ["status = %s", "updated_at = now()"]
-            params: list[Any] = [status]
-            if document_id is not None:
-                fields.append("document_id = %s")
-                params.append(document_id)
-            if error_message is not None:
-                fields.append("error_message = %s")
-                params.append(error_message)
-            elif status == "processing":
-                # Clear stale error message when a job starts processing
-                fields.append("error_message = NULL")
-            params.append(job_id)
-            await conn.execute(
-                f"UPDATE engram.ingest_jobs SET {', '.join(fields)} WHERE id = %s",
+        fields = ["status = ?", "updated_at = ?"]
+        params: list[Any] = [status, _now()]
+        if document_id is not None:
+            fields.append("document_id = ?")
+            params.append(document_id)
+        if error_message is not None:
+            fields.append("error_message = ?")
+            params.append(error_message)
+        elif status == "processing":
+            fields.append("error_message = NULL")
+        params.append(job_id)
+        await self._run(
+            lambda c: c.execute(
+                f"UPDATE ingest_jobs SET {', '.join(fields)} WHERE id = ?",
                 params,
             )
-
-        await self._run(_do)
+        )
 
     async def bump_heartbeat(self, job_id: str) -> None:
-        """Update last_heartbeat to now() — called by the worker every ~10s."""
-
-        async def _do(conn: Any) -> None:
-            await conn.execute(
-                "UPDATE engram.ingest_jobs SET last_heartbeat = now() WHERE id = %s",
-                (job_id,),
+        """Update last_heartbeat to now — called by the worker every ~10s."""
+        now = _now()
+        await self._run(
+            lambda c: c.execute(
+                "UPDATE ingest_jobs SET last_heartbeat = ? WHERE id = ?", (now, job_id)
             )
-
-        await self._run(_do)
+        )
 
     async def list_ingest_jobs(
         self,
         collection_id: str | None = None,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List jobs, optionally filtered by collection and/or status."""
+        """List jobs newest first, optionally filtered by collection and/or status."""
+        filters: list[str] = []
+        params: list[Any] = []
+        if collection_id:
+            filters.append("collection_id = ?")
+            params.append(collection_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = "WHERE " + " AND ".join(filters) if filters else ""
 
-        async def _do(conn: Any) -> list[dict[str, Any]]:
-            filters: list[str] = []
-            params: list[Any] = []
-            if collection_id:
-                filters.append("collection_id = %s")
-                params.append(collection_id)
-            if status:
-                filters.append("status = %s")
-                params.append(status)
-            where = "WHERE " + " AND ".join(filters) if filters else ""
-            rows = await (
-                await conn.execute(
-                    f"SELECT id, collection_id, document_id, status, filename, "
-                    f"object_key, error_message, last_heartbeat, created_at, updated_at "
-                    f"FROM engram.ingest_jobs {where} ORDER BY created_at DESC",
-                    params,
-                )
+        def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = c.execute(
+                "SELECT id, collection_id, document_id, status, filename, object_key, "
+                "error_message, last_heartbeat, created_at, updated_at "
+                f"FROM ingest_jobs {where} ORDER BY created_at DESC",
+                params,
             ).fetchall()
-            return [
-                {
-                    "id": r[0],
-                    "collection_id": r[1],
-                    "document_id": r[2],
-                    "status": r[3],
-                    "filename": r[4],
-                    "object_key": r[5],
-                    "error_message": r[6],
-                    "last_heartbeat": r[7].isoformat() if r[7] else None,
-                    "created_at": r[8].isoformat(),
-                    "updated_at": r[9].isoformat(),
-                }
-                for r in rows
-            ]
+            return [_job(r, with_hash=False) for r in rows]
 
         return await self._run(_do)
 
     async def delete_old_ingest_jobs(self, retention_days: int = 7) -> int:
         """Delete completed/failed jobs older than retention_days. Returns count deleted."""
-
-        async def _do(conn: Any) -> int:
-            result = await conn.execute(
-                "DELETE FROM engram.ingest_jobs "
-                "WHERE status IN ('completed', 'failed') "
-                "AND updated_at < now() - interval '1 day' * %s",
-                (retention_days,),
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        return await self._run(
+            lambda c: (
+                c.execute(
+                    "DELETE FROM ingest_jobs WHERE status IN ('completed', 'failed') AND updated_at < ?",
+                    (cutoff,),
+                ).rowcount
             )
-            return int(result.rowcount)
-
-        return await self._run(_do)
+        )
 
     async def recover_orphan_jobs(self, stale_seconds: int = 60) -> int:
-        """Re-queue jobs stuck in 'processing' with a stale heartbeat.
+        """Re-queue jobs stuck in 'processing' whose heartbeat is older than stale_seconds.
 
-        A job is stale if its last_heartbeat is older than stale_seconds ago
-        (using DB now() to avoid app-clock drift). Returns count recovered.
+        Engram and its workers share one process and clock, so the cutoff is computed here.
+        Returns count recovered.
         """
-
-        async def _do(conn: Any) -> int:
-            result = await conn.execute(
-                "UPDATE engram.ingest_jobs SET status = 'pending', "
-                "error_message = 'recovered: worker heartbeat stale', updated_at = now() "
-                "WHERE status = 'processing' "
-                "AND last_heartbeat < now() - interval '1 second' * %s",
-                (stale_seconds,),
+        now = datetime.now(UTC)
+        cutoff = (now - timedelta(seconds=stale_seconds)).isoformat()
+        return await self._run(
+            lambda c: (
+                c.execute(
+                    "UPDATE ingest_jobs SET status = 'pending', "
+                    "error_message = 'recovered: worker heartbeat stale', updated_at = ? "
+                    "WHERE status = 'processing' AND last_heartbeat < ?",
+                    (now.isoformat(), cutoff),
+                ).rowcount
             )
-            return int(result.rowcount)
-
-        return await self._run(_do)
+        )
 
     async def _sweep_orphan_objects(self, object_store: ObjectStore) -> int:
         """Delete object-store keys that have no matching job or document.
 
-        Called on startup to clean up partial uploads from crashed workers.
-        Returns the count of swept objects.
-
-        Note: Full sweep requires listing object keys from MinIO and
-        cross-referencing against DB. Implemented in E9 (job runner + lifespan
-        wiring) when both stores are available.
+        Placeholder until the object store can list its keys.
         """
-        # Placeholder — fleshed out in E9.
         return 0
 
     # ── Facts ─────────────────────────────────────────────────────────────
@@ -548,23 +540,21 @@ class Store:
         source: str | None,
         embedding: list[float] | None,
     ) -> None:
-        """Insert or update a distilled fact."""
+        """Insert or update a distilled fact. A fact without an embedding is not recallable."""
+        now = _now()
 
-        async def _do(conn: Any) -> None:
-            emb = _json.dumps(embedding) if embedding is not None else None
-            await conn.execute(
-                """
-                INSERT INTO engram.facts (id, workspace_id, content, tags, source, embedding, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s::vector, now())
-                ON CONFLICT (id) DO UPDATE
-                  SET content = EXCLUDED.content,
-                      tags = EXCLUDED.tags,
-                      source = EXCLUDED.source,
-                      embedding = EXCLUDED.embedding,
-                      updated_at = now()
-                """,
-                (fact_id, workspace_id, content, tags, source, emb),
+        def _do(c: sqlite3.Connection) -> None:
+            c.execute(
+                "INSERT INTO facts (id, workspace_id, content, tags, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET "
+                "content = excluded.content, tags = excluded.tags, source = excluded.source, "
+                "updated_at = excluded.updated_at",
+                (fact_id, workspace_id, content, json.dumps(tags), source, now, now),
             )
+            if embedding is None:
+                FACTS.delete(c, fact_id)
+            else:
+                FACTS.upsert(c, fact_id, workspace_id, embedding)
 
         await self._run(_do)
 
@@ -576,42 +566,33 @@ class Store:
     ) -> list[dict[str, Any]]:
         """Return the top-k facts nearest to *embedding* for the given workspace."""
 
-        async def _do(conn: Any) -> list[dict[str, Any]]:
-            emb = _json.dumps(embedding)
-            cur = await conn.execute(
-                """
-                SELECT id, content, tags, source, created_at,
-                       1 - (embedding <=> %s::vector) AS score
-                FROM engram.facts
-                WHERE workspace_id = %s AND embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (emb, workspace_id, emb, k),
-            )
-            rows = await cur.fetchall()
-            return [
-                {
-                    "id": r[0],
-                    "content": r[1],
-                    "tags": r[2] or [],
-                    "source": r[3],
-                    "created_at": r[4].isoformat() if r[4] else None,
-                    "score": float(r[5]) if r[5] is not None else 0.0,
-                }
-                for r in rows
-            ]
+        def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
+            hits = FACTS.similarity_search(c, workspace_id, embedding, k)
+            results = []
+            for fact_id, score in hits:
+                r = c.execute(
+                    "SELECT id, content, tags, source, created_at FROM facts WHERE id = ?",
+                    (fact_id,),
+                ).fetchone()
+                results.append(
+                    {
+                        "id": r[0],
+                        "content": r[1],
+                        "tags": json.loads(r[2]),
+                        "source": r[3],
+                        "created_at": r[4],
+                        "score": score,
+                    }
+                )
+            return results
 
         return await self._run(_do)
 
     async def delete_fact(self, fact_id: str) -> bool:
         """Delete a fact by ID. Returns True if deleted."""
-
-        async def _do(conn: Any) -> bool:
-            result = await conn.execute("DELETE FROM engram.facts WHERE id = %s", (fact_id,))
-            return int(result.rowcount) > 0
-
-        return await self._run(_do)
+        return await self._run(
+            lambda c: c.execute("DELETE FROM facts WHERE id = ?", (fact_id,)).rowcount > 0
+        )
 
     # ── Signals ───────────────────────────────────────────────────────────
 
@@ -624,19 +605,16 @@ class Store:
         content: str,
         embedding: list[float] | None,
     ) -> None:
-        """Record an outcome quality signal."""
+        """Record an outcome quality signal. Recording the same id twice is a no-op."""
 
-        async def _do(conn: Any) -> None:
-            emb = _json.dumps(embedding) if embedding is not None else None
-            await conn.execute(
-                """
-                INSERT INTO engram.signals
-                    (id, workspace_id, session_id, signal_type, content, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s::vector)
-                ON CONFLICT (id) DO NOTHING
-                """,
-                (signal_id, workspace_id, session_id, signal_type, content, emb),
-            )
+        def _do(c: sqlite3.Connection) -> None:
+            inserted = c.execute(
+                "INSERT INTO signals (id, workspace_id, session_id, signal_type, content, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                (signal_id, workspace_id, session_id, signal_type, content, _now()),
+            ).rowcount
+            if inserted and embedding is not None:
+                SIGNALS.upsert(c, signal_id, workspace_id, embedding, {"signal_type": signal_type})
 
         await self._run(_do)
 
@@ -648,45 +626,28 @@ class Store:
         signal_type: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return the top-k signals nearest to *embedding*."""
+        filters = {"signal_type": [signal_type]} if signal_type else None
 
-        async def _do(conn: Any) -> list[dict[str, Any]]:
-            emb = _json.dumps(embedding)
-            if signal_type:
-                cur = await conn.execute(
-                    """
-                    SELECT id, session_id, signal_type, content, created_at,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM engram.signals
-                    WHERE workspace_id = %s AND signal_type = %s AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    (emb, workspace_id, signal_type, emb, k),
+        def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
+            hits = SIGNALS.similarity_search(c, workspace_id, embedding, k, filters)
+            results = []
+            for signal_id, score in hits:
+                r = c.execute(
+                    "SELECT id, session_id, signal_type, content, created_at FROM signals "
+                    "WHERE id = ?",
+                    (signal_id,),
+                ).fetchone()
+                results.append(
+                    {
+                        "id": r[0],
+                        "session_id": r[1],
+                        "signal_type": r[2],
+                        "content": r[3],
+                        "created_at": r[4],
+                        "score": score,
+                    }
                 )
-            else:
-                cur = await conn.execute(
-                    """
-                    SELECT id, session_id, signal_type, content, created_at,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM engram.signals
-                    WHERE workspace_id = %s AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    (emb, workspace_id, emb, k),
-                )
-            rows = await cur.fetchall()
-            return [
-                {
-                    "id": r[0],
-                    "session_id": r[1],
-                    "signal_type": r[2],
-                    "content": r[3],
-                    "created_at": r[4].isoformat() if r[4] else None,
-                    "score": float(r[5]) if r[5] is not None else 0.0,
-                }
-                for r in rows
-            ]
+            return results
 
         return await self._run(_do)
 
@@ -704,32 +665,27 @@ class Store:
         """
         effective_modalities = modalities if modalities is not None else ["text"]
 
-        async def _do(conn: Any) -> list[dict[str, Any]]:
-            vec_str = str(embedding)
-            # Build modality placeholder list: (%s, %s, ...)
-            placeholders = ", ".join(["%s"] * len(effective_modalities))
-            rows = await (
-                await conn.execute(
-                    f"SELECT c.id, d.path, c.content, c.modality, c.chunker, "
-                    f"1 - (c.embedding <=> %s::vector) AS score "
-                    f"FROM engram.chunks c "
-                    f"JOIN engram.documents d ON d.id = c.document_id "
-                    f"WHERE d.collection_id = %s AND c.embedding IS NOT NULL "
-                    f"AND c.modality IN ({placeholders}) "
-                    f"ORDER BY c.embedding <=> %s::vector LIMIT %s",
-                    (vec_str, collection_id, *effective_modalities, vec_str, k),
+        def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
+            hits = CHUNKS.similarity_search(
+                c, collection_id, embedding, k, {"modality": effective_modalities}
+            )
+            results = []
+            for chunk_id, score in hits:
+                r = c.execute(
+                    "SELECT c.id, d.path, c.content, c.modality, c.chunker FROM chunks c "
+                    "JOIN documents d ON d.id = c.document_id WHERE c.id = ?",
+                    (chunk_id,),
+                ).fetchone()
+                results.append(
+                    {
+                        "chunk_id": r[0],
+                        "document_path": r[1],
+                        "content": r[2],
+                        "modality": r[3],
+                        "chunker": r[4],
+                        "score": score,
+                    }
                 )
-            ).fetchall()
-            return [
-                {
-                    "chunk_id": r[0],
-                    "document_path": r[1],
-                    "content": r[2],
-                    "modality": r[3],
-                    "chunker": r[4],
-                    "score": float(r[5]),
-                }
-                for r in rows
-            ]
+            return results
 
         return await self._run(_do)
