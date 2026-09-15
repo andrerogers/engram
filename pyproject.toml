@@ -8,9 +8,7 @@ dependencies = [
     "uvicorn[standard]~=0.37",
     "pydantic~=2.12",
     "python-dotenv>=1.0",
-    "psycopg[binary]>=3.2",
-    "psycopg-pool>=3.2",
-    "yoyo-migrations>=8.2",
+    "sqlite-vec>=0.1.9",
     "httpx>=0.28",
     "tiktoken>=0.9",
     "aioboto3>=13.0",
@@ -42,7 +40,7 @@ python_version = "3.13"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["optics", "optics.*", "yoyo", "tiktoken", "aioboto3", "aioboto3.*", "botocore", "botocore.*"]
+module = ["optics", "optics.*", "sqlite_vec", "tiktoken", "aioboto3", "aioboto3.*", "botocore", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

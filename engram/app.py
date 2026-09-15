@@ -19,7 +19,8 @@ from engram import embeddings
 from engram.clients.docling import DoclingClient
 from engram.clients.storage import InMemoryObjectStore, ObjectStore
 from engram.config import (
-    DATABASE_URL,
+    EMBEDDING_DIMENSIONS,
+    ENGRAM_DB_PATH,
     MAX_CONCURRENT_INGEST_JOBS,
     MAX_FILE_SIZE_MB,
     MINIO_ACCESS_KEY,
@@ -104,13 +105,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _store  # noqa: PLW0603
     await _docling.startup()
     await _object_store.startup()
-    if DATABASE_URL:
-        _store = Store(DATABASE_URL)
-        await _store.init_db()
-        await _runner.startup(_store)
-        log.info("engram started — store initialised")
-    else:
-        log.warning("engram started — no DATABASE_URL, store unavailable")
+    _store = Store(ENGRAM_DB_PATH, EMBEDDING_DIMENSIONS)
+    await _store.init_db()
+    await _runner.startup(_store)
+    log.info("engram started — store initialised")
     yield
     await _runner.shutdown_wait()
     if _store is not None:

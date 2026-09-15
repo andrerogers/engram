@@ -1,6 +1,6 @@
 # Engram
 
-**Engram** is the RAG (Retrieval-Augmented Generation) service of [brainstack](https://github.com/andrerogers/brainstack). It handles async document ingestion via Docling, MinIO object storage, token-aware chunking, OpenRouter embeddings, and pgvector similarity search — giving Hive access to a searchable, multimodal-ready knowledge base.
+**Engram** is the RAG (Retrieval-Augmented Generation) service of [brainstack](https://github.com/andrerogers/brainstack). It handles async document ingestion via Docling, MinIO object storage, token-aware chunking, OpenRouter embeddings, and sqlite-vec similarity search — giving Hive access to a searchable, multimodal-ready knowledge base.
 
 ---
 
@@ -14,9 +14,9 @@ Hive (orchestration core)
   ▼
 Engram (FastAPI :8613)
   │  Docling-serve sidecar (:5001) — PDF/DOCX → Markdown + chunking
-  │  MinIO (:9000)                 — raw file storage (Postgres holds zero bytes)
+  │  MinIO (:9000)                 — raw file storage (engram.db holds zero bytes)
   ▼
-PostgreSQL + pgvector (engram.* schema)
+SQLite engram.db + sqlite-vec (vec0 cosine indexes)
   │  OpenRouter embeddings
   ▼
 openai/text-embedding-3-small (1536 dims)
@@ -46,7 +46,8 @@ Hive calls Engram directly over HTTP — Cortex does not proxy these calls.
 engram/
 ├── engram/
 │   ├── app.py                      FastAPI app + lifespan (DB init, DoclingClient startup/shutdown)
-│   ├── store.py                    Async pgvector store (psycopg3 pool)
+│   ├── store.py                    SQLite store (engram.db) — rows, jobs, facts, signals
+│   ├── vector_store.py             VectorStore protocol + SqliteVecStore (the only sqlite-vec code)
 │   ├── models.py                   Pydantic request/response schemas
 │   ├── embeddings.py               OpenRouter batch embedding client (retry + backoff)
 │   ├── chunker.py                  Token-aware text chunking (tiktoken)
@@ -62,13 +63,6 @@ engram/
 │       ├── tiktoken_processor.py   TiktokenProcessor (sync; current default; Docling fallback)
 │       ├── docling_text.py         DoclingTextProcessor stub (E8)
 │       └── docling_file.py         DoclingFileProcessor stub (E8)
-├── migrations/
-│   ├── 0001.create_collections.sql
-│   ├── 0002.create_documents_and_chunks.sql
-│   ├── 0003.add_indexes.sql
-│   ├── 0004.add_modality_and_chunker.sql    modality/chunker fields + partial HNSW WHERE modality='text'
-│   ├── 0005.create_ingest_jobs.sql          async job table with last_heartbeat
-│   └── 0006.add_document_object_storage.sql  object_key/source_mime/file_size/file_hash + SHA-256 dedup index
 ├── tests/
 │   ├── unit/                       Hermetic tests, no network (53 passing, <1s)
 │   │   ├── test_storage_contract.py    ObjectStoreContract — 11 behavioral tests
@@ -91,12 +85,12 @@ engram/
 
 ## Setup
 
-**Prerequisites:** Python 3.13, [uv](https://docs.astral.sh/uv/), PostgreSQL with pgvector (`pgvector/pgvector:pg16` — requires pgvector ≥ 0.7.0 for partial HNSW index)
+**Prerequisites:** Python 3.13, [uv](https://docs.astral.sh/uv/), nothing else — the database is a local SQLite file
 
 ```bash
 cd engram
 cp .env.example .env
-# Set DATABASE_URL, OPENROUTER_API_KEY
+# Set OPENROUTER_API_KEY (engram.db is created at ~/.brainstack/engram.db on first start)
 uv sync
 uv run task dev      # uvicorn on :8613 with --reload
 ```
@@ -107,7 +101,7 @@ uv run task dev      # uvicorn on :8613 with --reload
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | — | PostgreSQL connection string (required) |
+| `ENGRAM_DB_PATH` | `~/.brainstack/engram.db` | SQLite database file |
 | `ENGRAM_PORT` | `8613` | HTTP port |
 | `OPENROUTER_API_KEY` | — | Required for `/index` and `/retrieve` |
 | `DOCLING_URL` | `http://localhost:5001` | Docling-serve base URL |
@@ -133,18 +127,21 @@ uv run task dev      # uvicorn on :8613 with --reload
 
 ## Database schema
 
-All tables in the `engram` PostgreSQL schema. Migrations via yoyo-migrations (isolated `_engram_yoyo_*` tables).
+All tables live in `engram.db`. Migrations are ordered SQL in `engram/store.py` (`_migrations`), applied with `PRAGMA user_version`.
 
 | Table | Key columns |
 |-------|-------------|
-| `engram.collections` | `id`, `workspace_id`, `name`, `created_at` |
-| `engram.documents` | `id`, `collection_id`, `path`, `metadata`, `object_key`, `file_hash`, `file_size`, `source_mime` |
-| `engram.chunks` | `id`, `document_id`, `content`, `embedding vector(1536)`, `modality`, `chunker`, `chunker_version`, `media_ref` |
-| `engram.ingest_jobs` | `id`, `collection_id`, `document_id`, `status`, `filename`, `object_key`, `last_heartbeat`, `error_message` |
+| `collections` | `id`, `workspace_id`, `name`, `created_at` |
+| `documents` | `id`, `collection_id`, `path`, `metadata`, `object_key`, `file_hash`, `file_size`, `source_mime` |
+| `chunks` | `id`, `document_id`, `content`, `modality`, `chunker`, `chunker_version`, `media_ref` |
+| `ingest_jobs` | `id`, `collection_id`, `document_id`, `status`, `filename`, `object_key`, `last_heartbeat`, `error_message` |
 
 **SHA-256 dedup:** partial unique index on `(collection_id, file_hash) WHERE file_hash IS NOT NULL`. Same file submitted to the same collection is a no-op.
 
-**Partial HNSW index:** `WHERE modality = 'text'` — only text chunks are ANN-searched in Phase 1. Image/audio/video embeddings (Phase 2+) don't inflate search cost.
+| `facts` / `signals` | distilled facts and outcome signals, scoped by `workspace_id` |
+| `chunk_vectors` / `fact_vectors` / `signal_vectors` | vec0 virtual tables: `FLOAT[1536] distance_metric=cosine`, partitioned by collection or workspace |
+
+**Vectors:** every vector search goes through `VectorStore` (`engram/vector_store.py`). Search is exact k-nearest-neighbour — sqlite-vec has no approximate (HNSW) index — filtered by partition key and metadata (`modality`, `signal_type`). Retrieval defaults to `modality = 'text'`. Triggers delete a row's vector when the row is deleted, including by `ON DELETE CASCADE`.
 
 ---
 
@@ -197,9 +194,9 @@ uv run pytest -m integration tests/integration/test_docling_real.py -v
 |-------|---------|
 | Web framework | FastAPI + Uvicorn |
 | Validation | Pydantic v2 |
-| Database | psycopg v3 async + psycopg-pool |
-| Migrations | yoyo-migrations |
-| Vector search | pgvector ≥ 0.7.0 (partial HNSW, cosine) |
+| Database | SQLite (stdlib `sqlite3`, WAL) |
+| Migrations | ordered SQL + `PRAGMA user_version` |
+| Vector search | sqlite-vec vec0 (exact KNN, cosine) |
 | Tokenizer | tiktoken `cl100k_base` |
 | Embeddings | OpenRouter `openai/text-embedding-3-small` |
 | Object storage | aioboto3 / MinIO (S3-compatible) |
