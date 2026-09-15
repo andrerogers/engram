@@ -1,12 +1,12 @@
 """E13 — End-to-end integration test: PDF upload → ingest → retrieve.
 
-Requires external services running (use main docker-compose.yml):
-    docker compose up -d postgres minio docling
+Requires external services running:
+    docker compose -f compose.test.yml up -d minio docling
     uv run pytest -m integration tests/integration/test_end_to_end.py -v
 
 Pipeline verified:
     PDF bytes → MinIO object store → DoclingFileProcessor (real Docling)
-    → embeddings (mocked deterministic) → pgvector store → retrieve returns chunks
+    → embeddings (mocked deterministic) → SQLite + sqlite-vec store → retrieve returns chunks
 """
 
 from __future__ import annotations
@@ -26,9 +26,6 @@ from engram.store import Store
 
 pytestmark = pytest.mark.integration
 
-_DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://brainstack:brainstack@localhost:5432/brainstack"
-)
 _MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://localhost:9000")
 _MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
 _MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
@@ -41,8 +38,8 @@ _FAKE_EMBEDDING = [0.1] * 1536
 
 
 @pytest.fixture
-async def store() -> Store:  # type: ignore[misc]
-    s = Store(_DATABASE_URL)
+async def store(tmp_path: Path) -> Store:  # type: ignore[misc]
+    s = Store(tmp_path / "engram.db")
     await s.init_db()
     yield s
     await s.close()
