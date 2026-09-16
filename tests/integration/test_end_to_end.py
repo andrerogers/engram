@@ -1,36 +1,29 @@
-"""E13 — End-to-end integration test: PDF upload → ingest → retrieve.
+"""E13 — End-to-end: PDF upload → ingest → retrieve, with real Docling in-process.
 
-Requires external services running:
-    docker compose -f compose.test.yml up -d minio docling
-    uv run pytest -m integration tests/integration/test_end_to_end.py -v
+Needs the optional extra, no containers:
+    uv sync --extra docling
+    uv run pytest -m docling tests/integration/test_end_to_end.py -v
 
 Pipeline verified:
-    PDF bytes → MinIO object store → DoclingFileProcessor (real Docling)
+    PDF bytes → local object store → DoclingFileProcessor (real Docling, in-process)
     → embeddings (mocked deterministic) → SQLite + sqlite-vec store → retrieve returns chunks
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from engram.clients.docling import DoclingClient
-from engram.clients.storage.minio import MinioObjectStore
+from engram.clients.docling import DoclingEngine
+from engram.clients.storage.local import LocalFileObjectStore
 from engram.jobs.ingest import run_ingest_job
 from engram.processors import get_file_processor
 from engram.store import Store
 
-pytestmark = pytest.mark.integration
-
-_MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://localhost:9000")
-_MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-_MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
-_MINIO_BUCKET = "engram-e2e"
-_DOCLING_URL = os.environ.get("DOCLING_URL", "http://localhost:5001")
+pytestmark = pytest.mark.docling
 
 _FIXTURE_PDF = Path(__file__).parent / "fixtures" / "sample.pdf"
 
@@ -46,30 +39,20 @@ async def store(tmp_path: Path) -> Store:  # type: ignore[misc]
 
 
 @pytest.fixture
-async def object_store() -> MinioObjectStore:  # type: ignore[misc]
-    s = MinioObjectStore(
-        endpoint=_MINIO_ENDPOINT,
-        access_key=_MINIO_ACCESS_KEY,
-        secret_key=_MINIO_SECRET_KEY,
-        bucket=_MINIO_BUCKET,
-    )
+async def object_store(tmp_path: Path) -> LocalFileObjectStore:  # type: ignore[misc]
+    s = LocalFileObjectStore(tmp_path / "objects")
     await s.startup()
     yield s
     await s.shutdown()
 
 
 @pytest.fixture
-async def docling() -> DoclingClient:  # type: ignore[misc]
-    client = DoclingClient(
-        base_url=_DOCLING_URL,
-        enabled=True,
-        timeout=120.0,
-        poll_interval=2.0,
-        max_wait=300.0,
-    )
-    await client.startup()
-    yield client
-    await client.shutdown()
+async def docling() -> DoclingEngine:  # type: ignore[misc]
+    engine = DoclingEngine(enabled=True)
+    await engine.startup()
+    assert await engine.health(), "install the extra: uv sync --extra docling"
+    yield engine
+    await engine.shutdown()
 
 
 @pytest.fixture
@@ -80,8 +63,8 @@ async def collection_id(store: Store) -> str:
 
 async def test_pdf_ingest_and_retrieve(
     store: Store,
-    object_store: MinioObjectStore,
-    docling: DoclingClient,
+    object_store: LocalFileObjectStore,
+    docling: DoclingEngine,
     collection_id: str,
 ) -> None:
     """Full pipeline: PDF → Docling chunks → pgvector → retrieve."""
@@ -120,8 +103,8 @@ async def test_pdf_ingest_and_retrieve(
 
 async def test_dedup_second_upload_returns_existing_document(
     store: Store,
-    object_store: MinioObjectStore,
-    docling: DoclingClient,
+    object_store: LocalFileObjectStore,
+    docling: DoclingEngine,
     collection_id: str,
 ) -> None:
     """Same file bytes uploaded twice → second job sees duplicate_of_job_id or same doc."""
@@ -159,11 +142,11 @@ async def test_dedup_second_upload_returns_existing_document(
 
 async def test_list_and_delete_document(
     store: Store,
-    object_store: MinioObjectStore,
-    docling: DoclingClient,
+    object_store: LocalFileObjectStore,
+    docling: DoclingEngine,
     collection_id: str,
 ) -> None:
-    """Ingest a file, list documents, delete — object must be removed from MinIO."""
+    """Ingest a file, list documents, delete — object must be removed from the store."""
     file_processor = get_file_processor(docling)
     pdf_bytes = _FIXTURE_PDF.read_bytes()
     object_key = f"uploads/{collection_id}/delete-sample.pdf"

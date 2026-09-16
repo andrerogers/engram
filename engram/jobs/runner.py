@@ -4,7 +4,7 @@ Owns:
 - Concurrency cap (asyncio.Semaphore, default MAX_CONCURRENT_INGEST_JOBS=4)
 - Per-job heartbeat task (bumps last_heartbeat every 10s)
 - Orphan recovery on startup
-- Hourly cleanup (docling.clear_results + delete_old_ingest_jobs)
+- Hourly cleanup (delete_old_ingest_jobs)
 - shutdown_wait(timeout=30s) to drain in-flight jobs on FastAPI lifespan exit
 
 Usage in app.py:
@@ -27,7 +27,7 @@ from engram.config import INGEST_HEARTBEAT_STALE_SECONDS, INGEST_JOB_RETENTION_D
 from engram.jobs.ingest import run_ingest_job
 
 if TYPE_CHECKING:
-    from engram.clients.docling import DoclingClient
+    from engram.clients.docling import DoclingEngine
     from engram.clients.storage.base import ObjectStore
     from engram.processors.base import FileProcessor
     from engram.store import Store
@@ -42,7 +42,7 @@ _SHUTDOWN_TIMEOUT = 30  # seconds
 class Runner:
     """App-level ingest job manager."""
 
-    def __init__(self, max_concurrent: int, docling: DoclingClient) -> None:
+    def __init__(self, max_concurrent: int, docling: DoclingEngine) -> None:
         self._max_concurrent = max_concurrent
         self._docling = docling
         self._sem: asyncio.Semaphore | None = None
@@ -122,11 +122,9 @@ class Runner:
                 await store.bump_heartbeat(job_id)
 
     async def _hourly_cleanup(self, store: Store) -> None:
-        """Every hour: clear Docling result cache + purge old terminal jobs."""
+        """Every hour: purge old terminal jobs. Docling runs in-process — no result cache."""
         while True:
             await asyncio.sleep(_CLEANUP_INTERVAL)
-            with suppress(Exception):
-                await self._docling.clear_results()
             with suppress(Exception):
                 deleted = await store.delete_old_ingest_jobs(
                     retention_days=INGEST_JOB_RETENTION_DAYS

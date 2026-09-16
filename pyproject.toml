@@ -11,13 +11,29 @@ dependencies = [
     "sqlite-vec>=0.1.9",
     "httpx>=0.28",
     "tiktoken>=0.9",
-    "aioboto3>=13.0",
     "brainstack-optics",
     "python-multipart>=0.0.26",
 ]
 
 [tool.uv.sources]
 brainstack-optics = { path = "../optics/optics-py", editable = true }
+# Docling's default torch wheel bundles CUDA (several GB). Document conversion runs fine on CPU,
+# so the extra pins the CPU build; install a CUDA torch yourself for GPU-accelerated OCR.
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[project.optional-dependencies]
+# Docling runs in-process for PDF/DOCX conversion and hybrid chunking. It pulls torch and
+# transformers (several GB), so it is opt-in: `uv sync --extra docling`. Without it, text falls
+# back to tiktoken chunking and binary ingest fails with a clear message.
+# torch is listed explicitly so the CPU-index pin below applies — uv sources only bind a
+# project's own dependencies, not ones pulled in transitively.
+docling = ["docling>=2.55", "torch>=2.4", "torchvision>=0.19"]
 
 [dependency-groups]
 dev = [
@@ -40,16 +56,16 @@ python_version = "3.13"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["optics", "optics.*", "sqlite_vec", "tiktoken", "aioboto3", "aioboto3.*", "botocore", "botocore.*"]
+module = ["optics", "optics.*", "sqlite_vec", "tiktoken", "docling.*", "docling_core.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-    "integration: tests that require external services (MinIO, Docling, Postgres)",
+    "docling: tests that run real Docling in-process (needs `uv sync --extra docling`)",
 ]
-addopts = "-m 'not integration'"
+addopts = "-m 'not docling'"
 
 [tool.uv]
 python-preference = "only-managed"
@@ -57,7 +73,6 @@ python-preference = "only-managed"
 [tool.taskipy.tasks]
 dev      = "uvicorn engram.app:app --reload --port 8613"
 test     = "pytest -v -s"
-integration = "pytest -v -s -m integration"
 test-all = "pytest -v -s -m ''"
 lint     = "ruff check ."
 typecheck = "mypy engram"

@@ -1,94 +1,50 @@
-# Engram — DoclingClient Verification Record
+# Engram — Docling Verification Record
 
-**Status:** Verified 2026-04-16 against docling-serve 1.16.1.
+**Status:** verified 2026-09-15 against `docling 2.127.0` / `docling-core 2.96.0`, running
+**in-process** (no docling-serve sidecar). Previous record covered docling-serve 1.16.1 over HTTP;
+that client and its polling are gone.
 
-This file records the verified Docling-serve API behavior that `engram/clients/docling.py`
-is written against. Update this file whenever:
-- Docling-serve is upgraded and API behavior changes
-- Any assumption below is found to be wrong
+This file records what `engram/clients/docling.py` is written against, verified by running it —
+not read from documentation. Update it whenever Docling is upgraded and behaviour changes, or an
+assumption below is found to be wrong. The fix goes in `DoclingEngine`; the record goes here.
 
 ---
 
-## How to run the verification gate
+## How to run the gate
 
 ```bash
-# 1. Start Docling
-docker compose -f compose.test.yml up -d docling
-
-# 2. Wait for Docling to be healthy (may take ~30s on first pull)
-docker compose -f compose.test.yml ps
-
-# 3. Manual curl smoke checks (record results in the table below)
-curl -s http://localhost:15001/health | jq .
-curl -s http://localhost:15001/version | jq .
-
-# 4. Submit a test file
-SUBMIT=$(curl -s -X POST http://localhost:15001/v1/convert/file/async \
-  -F "files=@tests/integration/fixtures/sample.pdf" \
-  -F "to=markdown")
-echo "$SUBMIT"
-TASK_ID=$(echo "$SUBMIT" | jq -r '.task_id')
-
-# 5. Poll status
-curl -s "http://localhost:15001/v1/status/poll/${TASK_ID}?wait=30" | jq .
-
-# 6. Fetch result
-curl -s "http://localhost:15001/v1/result/${TASK_ID}" | jq '{md_content: .document.md_content}'
-
-# 7. Run automated integration tests
-uv run pytest -m integration tests/integration/test_docling_real.py -v
+uv sync --extra docling                       # ~1.6 GB (CPU wheels)
+uv run pytest -m docling -v                   # engine + end-to-end pipeline
 ```
 
----
+`-m docling` is deselected by default (`addopts` in `pyproject.toml`), so neither CI nor a normal
+`uv run task test` pays for it.
 
-## Verified API assumptions
+## Verified API surface
 
-| Assumption | Expected value | Verified value | Confirmed |
-|---|---|---|---|
-| Health endpoint | `GET /health` → 200 | `{"status": "ok"}` | [x] |
-| Convert endpoint | `POST /v1/convert/file/async` | 200, returns `task_id` | [x] |
-| Chunk hybrid endpoint | `POST /v1/chunk/hybrid/file/async` | 200, returns `task_id` | [x] |
-| Chunk hierarchical endpoint | `POST /v1/chunk/hierarchical/file/async` | 200, returns `task_id` | [x] |
-| Status poll endpoint | `GET /v1/status/poll/{task_id}?wait=30` | 200, returns status object | [x] |
-| Result endpoint | `GET /v1/result/{task_id}` | 200, returns result object | [x] |
-| Clear results endpoint | `GET /v1/clear/results?older_then=N` | 200 | [x] |
-| Submit response field | `task_id` at top level | `task_id` at top level | [x] |
-| Status field name | `task_status` | `task_status` | [x] |
-| Status success value | `"success"` | `"success"` | [x] |
-| Status failure value | `"failure"` | not observed (see deviation below) | [x] |
-| Status pending value | `"pending"` or `"started"` | `"pending"` | [x] |
-| Error field on failure | `error_message` | `error_message` (null when no error) | [x] |
-| Convert result path | `result.document.md_content` | `result.document.md_content` | [x] |
-| Chunk list path | `result.chunks` | `result.chunks` | [x] |
-| Chunk text field | `chunk["text"]` | `chunk["text"]` | [x] |
-| Corrupted file → failure | `task_status: "failure"` with error_message | `task_status: "success"`, `md_content: null`, `pages: 0` | [x] |
-
----
-
-## Docling-serve version pinned
-
-| Field | Value |
+| Call | Verified behaviour |
 |---|---|
-| Image | `quay.io/docling-project/docling-serve:latest` |
-| `docling-serve` | 1.16.1 |
-| `docling` | 2.88.0 |
-| `docling-core` | 2.72.0 |
-| `docling-jobkit` | 1.17.0 |
-| `docling-ibm-models` | 3.13.0 |
-| `docling-parse` | 5.8.0 |
-| Python | cpython-312 (3.12.12) |
-| Date verified | 2026-04-16 |
-| Verified by | integration test suite (7/7 passed) |
+| `from docling.document_converter import DocumentConverter` | Constructed once at startup; the first conversion otherwise pays model load. |
+| `from docling.chunking import HybridChunker` | Default constructor needs no tokenizer argument. |
+| `from docling_core.types.io import DocumentStream` | `DocumentStream(name=<filename>, stream=BytesIO(data))` is how bytes are converted without touching disk. The **name matters**: the extension selects the backend. |
+| `converter.convert(source)` | Returns a result whose `.document` is the `DoclingDocument`. Raises on unsupported or corrupt input — wrapped as `DoclingFailed`. |
+| `chunker.chunk(dl_doc=document)` | Returns an iterator; the keyword is `dl_doc`, not a positional document. |
+| `chunker.contextualize(chunk=c)` | Returns the chunk text enriched with its heading context. Used in preference to `c.text`, falling back to it when empty. |
+| `document.export_to_markdown()` | Markdown for the whole document. |
 
----
+## Behaviour worth knowing
 
-## Known deviations from plan assumptions
-
-**Corrupted file handling:** The plan assumed Docling returns `task_status: "failure"` for
-invalid/garbage bytes. Verified behavior (docling-serve 1.16.1): Docling returns
-`task_status: "success"` with `md_content: null` and `pages: 0`. No error is raised.
-
-Fix applied: `convert_file_to_markdown` already coerced `None → ""` via
-`str(document.get("md_content") or "")`, so the client handles this gracefully.
-`test_corrupted_file_raises_task_failed` was renamed to
-`test_corrupted_file_returns_empty_string` and updated to assert `result == ""`.
+- **Synchronous and CPU-bound.** Every call runs in a worker thread (`asyncio.to_thread`);
+  nothing in the event loop blocks on conversion.
+- **First run downloads OCR models** (RapidOCR, ~21 MB) into the virtualenv's `site-packages`,
+  from an external host. A first conversion on a machine with no network will fail; subsequent
+  ones are local. Conversions in the gate take ~8 s for the sample PDF after warm-up.
+- **CPU wheels are pinned deliberately.** `pyproject.toml` lists `torch` and `torchvision`
+  explicitly in the `docling` extra and points them at PyTorch's CPU index. Without that, uv
+  resolves CUDA builds (~5 GB, plus triton and nvidia-* packages). uv's `tool.uv.sources` only
+  binds a project's **own** dependencies, so listing them transitively through `docling` is not
+  enough — that mismatch produced `RuntimeError: operator torchvision::nms does not exist`,
+  because torch came from the CPU index and torchvision from PyPI.
+- **Absence is a supported state.** Without the extra, `DoclingEngine.startup()` logs a warning
+  and disables itself: text chunking falls back to tiktoken, binary ingest raises
+  `DoclingUnavailable` naming the install command. Covered by tests that fake the missing import.
