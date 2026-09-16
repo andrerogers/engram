@@ -1,6 +1,6 @@
 """ObjectStore abstract base class.
 
-All storage backends (InMemory, MinIO) implement this interface.
+All storage backends (LocalFile, InMemory) implement this interface.
 The contract is enforced by ObjectStoreContract in tests/unit/test_storage_contract.py.
 """
 
@@ -52,6 +52,6 @@ class ObjectStore(ABC):
     async def presigned_url(self, key: str, expires_in: int = 3600) -> str:
         """Return a URL that gives direct access to *key* for *expires_in* seconds.
 
-        For backends without real URL signing (e.g. InMemory), a sentinel
-        path ``/documents/_object/{key}`` is returned.
+        Neither backend signs URLs, so both return the sentinel path
+        ``/documents/_object/{key}``, which the read-through route serves.
         """

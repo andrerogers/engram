@@ -1,6 +1,6 @@
 # Engram
 
-**Engram** is the RAG (Retrieval-Augmented Generation) service of [brainstack](https://github.com/andrerogers/brainstack). It handles async document ingestion via Docling, MinIO object storage, token-aware chunking, OpenRouter embeddings, and sqlite-vec similarity search — giving Hive access to a searchable, multimodal-ready knowledge base.
+**Engram** is the RAG (Retrieval-Augmented Generation) service of [brainstack](https://github.com/andrerogers/brainstack). It handles async document ingestion via Docling (in-process), local file object storage, token-aware chunking, OpenRouter embeddings, and sqlite-vec similarity search — giving Hive access to a searchable, multimodal-ready knowledge base.
 
 ---
 
@@ -13,8 +13,8 @@ Hive (orchestration core)
   │  HTTP  GET  /retrieve          ← fetch relevant chunks for a chat request
   ▼
 Engram (FastAPI :8613)
-  │  Docling-serve sidecar (:5001) — PDF/DOCX → Markdown + chunking
-  │  MinIO (:9000)                 — raw file storage (engram.db holds zero bytes)
+  │  Docling (in-process, optional extra) — PDF/DOCX → Markdown + chunking
+  │  ~/.brainstack/objects/               — raw file storage (engram.db holds zero bytes)
   ▼
 SQLite engram.db + sqlite-vec (vec0 cosine indexes)
   │  OpenRouter embeddings
@@ -53,11 +53,11 @@ engram/
 │   ├── chunker.py                  Token-aware text chunking (tiktoken)
 │   ├── config.py                   All settings from env vars
 │   ├── clients/
-│   │   ├── docling.py              DoclingClient — async Docling-serve HTTP client
+│   │   ├── docling.py              DoclingEngine — in-process convert + hybrid chunk
 │   │   └── storage/
 │   │       ├── base.py             ObjectStore ABC (put/get/exists/delete/presigned_url)
-│   │       ├── memory.py           InMemoryObjectStore (dev/test; sentinel presigned URLs)
-│   │       └── minio.py            MinioObjectStore (aioboto3, S3-compatible)
+│   │       ├── memory.py           InMemoryObjectStore (tests; sentinel presigned URLs)
+│   │       └── local.py            LocalFileObjectStore — atomic writes, key validation
 │   └── processors/
 │       ├── base.py                 Modality + ChunkerKind enums, ChunkCandidate dataclass, Protocols
 │       ├── tiktoken_processor.py   TiktokenProcessor (sync; current default; Docling fallback)
@@ -69,14 +69,13 @@ engram/
 │   │   ├── test_storage_memory.py      InMemory passes contract
 │   │   ├── test_processors.py          TiktokenProcessor
 │   │   ├── test_ingest_jobs.py         Job CRUD + orphan recovery
-│   │   └── test_docling_client.py      DoclingClient (httpx-mocked, 17 tests)
-│   ├── integration/                Real-service tests (opt-in: -m integration)
+│   │   ├── test_storage_local.py       LocalFile passes contract + traversal/atomicity
+│   │   └── test_docling_engine.py      DoclingEngine availability + fallbacks (+ `docling` mark)
+│   ├── integration/                Opt-in suites
 │   │   ├── fixtures/sample.{pdf,md}    Test fixtures
-│   │   ├── test_storage_minio.py       MinIO passes ObjectStoreContract
-│   │   └── test_docling_real.py        E7 gate — 7 tests against real Docling-serve
+│   │   └── test_end_to_end.py          PDF → objects → Docling → sqlite-vec (`-m docling`)
 │   └── test_routes.py              Route tests (mocked store + embeddings)
-├── compose.test.yml                MinIO (:19000) + Docling (:15001) for integration tests
-├── VERIFICATION.md                 Verified Docling-serve API shape (fill after E7 gate)
+├── VERIFICATION.md                 Verified Docling API shape (run `-m docling` to re-verify)
 ├── pyproject.toml
 └── .env.example
 ```
@@ -104,16 +103,9 @@ uv run task dev      # uvicorn on :8613 with --reload
 | `ENGRAM_DB_PATH` | `~/.brainstack/engram.db` | SQLite database file |
 | `ENGRAM_PORT` | `8613` | HTTP port |
 | `OPENROUTER_API_KEY` | — | Required for `/index` and `/retrieve` |
-| `DOCLING_URL` | `http://localhost:5001` | Docling-serve base URL |
-| `DOCLING_ENABLED` | `true` | Set `false` → tiktoken fallback |
-| `DOCLING_TIMEOUT` | `120.0` | Per-request HTTP timeout (s) |
-| `DOCLING_POLL_INTERVAL` | `2.0` | Poll sleep interval (s) |
-| `DOCLING_MAX_WAIT` | `600.0` | Max wait per Docling task (s) |
-| `MINIO_ENDPOINT` | `http://localhost:9000` | MinIO endpoint |
-| `MINIO_ACCESS_KEY` | `minioadmin` | MinIO access key |
-| `MINIO_SECRET_KEY` | `minioadmin` | MinIO secret key |
-| `MINIO_BUCKET` | `engram` | MinIO bucket name |
-| `MINIO_ENABLED` | `false` | `true` → MinIO; `false` → InMemory |
+| `BRAINSTACK_HOME` | `~/.brainstack` | Base for the database and object store |
+| `ENGRAM_OBJECT_DIR` | `<BRAINSTACK_HOME>/objects` | Raw file storage |
+| `DOCLING_ENABLED` | `true` | Set `false` → tiktoken fallback, no Docling |
 | `MAX_CONCURRENT_INGEST_JOBS` | `4` | Worker concurrency cap (E9) |
 | `MAX_FILE_SIZE_MB` | `50` | Max upload size for `/index/file` (E10) |
 | `INGEST_HEARTBEAT_STALE_SECONDS` | `60` | Heartbeat age before orphan recovery |
@@ -163,9 +155,9 @@ All processors output `list[ChunkCandidate]`. Each candidate carries `content`, 
 
 ```
 POST /index/file → create job (pending) → schedule worker
-worker: upload to MinIO → Docling parse → embed → store → mark completed
+worker: write to the object store → Docling parse → embed → store → mark completed
          ↕ bump last_heartbeat every 10s
-startup: recover_orphan_jobs() re-queues stale processing jobs (DB now(), not app clock)
+startup: recover_orphan_jobs() re-queues stale processing jobs
 ```
 
 ---
@@ -177,13 +169,9 @@ uv run task dev       # uvicorn --reload on :8613
 uv run task test      # pytest -v (integration tests excluded by default)
 uv run task check     # ruff check + format --check + pytest
 
-# Integration tests (requires compose.test.yml)
-docker compose -f compose.test.yml up -d
-uv run pytest -m integration -v
-
-# E7 verification gate (must pass before E8)
-docker compose -f compose.test.yml up -d docling
-uv run pytest -m integration tests/integration/test_docling_real.py -v
+# Real Docling (optional extra, ~1.6 GB of CPU wheels — never installed in CI)
+uv sync --extra docling
+uv run pytest -m docling -v
 ```
 
 ---
@@ -199,8 +187,8 @@ uv run pytest -m integration tests/integration/test_docling_real.py -v
 | Vector search | sqlite-vec vec0 (exact KNN, cosine) |
 | Tokenizer | tiktoken `cl100k_base` |
 | Embeddings | OpenRouter `openai/text-embedding-3-small` |
-| Object storage | aioboto3 / MinIO (S3-compatible) |
-| Document parsing | Docling-serve (async task API) |
+| Object storage | local filesystem (`LocalFileObjectStore`, atomic writes) |
+| Document parsing | Docling, in-process (optional `docling` extra) |
 | HTTP client | httpx (async) |
 | Observability | brainstack-optics (OTel) |
 

@@ -1,4 +1,4 @@
-"""In-memory ObjectStore implementation — for tests and local dev without MinIO."""
+"""In-memory ObjectStore implementation — for tests that need no filesystem."""
 
 from __future__ import annotations
 

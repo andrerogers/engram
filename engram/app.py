@@ -16,18 +16,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from engram import embeddings
-from engram.clients.docling import DoclingClient
-from engram.clients.storage import InMemoryObjectStore, ObjectStore
+from engram.clients.docling import DoclingEngine
+from engram.clients.storage import LocalFileObjectStore, ObjectStore
 from engram.config import (
     EMBEDDING_DIMENSIONS,
     ENGRAM_DB_PATH,
+    ENGRAM_OBJECT_DIR,
     MAX_CONCURRENT_INGEST_JOBS,
     MAX_FILE_SIZE_MB,
-    MINIO_ACCESS_KEY,
-    MINIO_BUCKET,
-    MINIO_ENABLED,
-    MINIO_ENDPOINT,
-    MINIO_SECRET_KEY,
 )
 from engram.jobs.runner import Runner
 from engram.models import (
@@ -73,19 +69,10 @@ from engram.store import Store
 
 
 def _make_object_store() -> ObjectStore:
-    if MINIO_ENABLED:
-        from engram.clients.storage.minio import MinioObjectStore
-
-        return MinioObjectStore(
-            endpoint=MINIO_ENDPOINT,
-            access_key=MINIO_ACCESS_KEY,
-            secret_key=MINIO_SECRET_KEY,
-            bucket=MINIO_BUCKET,
-        )
-    return InMemoryObjectStore()
+    return LocalFileObjectStore(ENGRAM_OBJECT_DIR)
 
 
-_docling: DoclingClient = DoclingClient()
+_docling: DoclingEngine = DoclingEngine()
 _processor = get_text_processor(_docling)
 _file_processor = get_file_processor(_docling)
 _runner: Runner = Runner(MAX_CONCURRENT_INGEST_JOBS, _docling)
@@ -345,20 +332,13 @@ async def document_original(document_id: str) -> RedirectResponse:
 
 @app.get("/documents/_object/{key:path}")
 async def document_object_passthrough(key: str) -> Response:
-    """Read-through route for InMemory object store (config-gated — not for MinIO).
-
-    Returns raw bytes with status 200.  Disabled when MINIO_ENABLED=True —
-    use the presigned URL from GET /documents/{id}/original instead.
-    """
-    if MINIO_ENABLED:
-        raise HTTPException(
-            status_code=404,
-            detail="Read-through not available with MinIO — use /documents/{id}/original",
-        )
+    """Serve an object's raw bytes — where `presigned_url` points, since files cannot sign URLs."""
     try:
         data = await _object_store.get(key)
     except KeyError:
         raise HTTPException(status_code=404, detail="Object not found") from None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid object key") from None
     return Response(content=data, media_type="application/octet-stream")
 
 
