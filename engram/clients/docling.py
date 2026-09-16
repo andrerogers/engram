@@ -37,17 +37,19 @@ class DoclingEngine:
         self._enabled = DOCLING_ENABLED if enabled is None else enabled
         self._converter: Any = None
         self._chunker: Any = None
+        self._stream: Any = None
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
-    def _build(self) -> tuple[Any, Any]:
+    def _build(self) -> tuple[Any, Any, Any]:
         # docling.chunking re-exports this without __all__, so import from its defining module.
         from docling.document_converter import DocumentConverter
         from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
+        from docling_core.types.io import DocumentStream
 
-        return DocumentConverter(), HybridChunker()
+        return DocumentConverter(), HybridChunker(), DocumentStream
 
     async def startup(self) -> None:
         """Import Docling and build the converter and chunker. Idempotent.
@@ -58,7 +60,7 @@ class DoclingEngine:
         if not self._enabled or self._converter is not None:
             return
         try:
-            self._converter, self._chunker = await asyncio.to_thread(self._build)
+            self._converter, self._chunker, self._stream = await asyncio.to_thread(self._build)
         except ImportError:
             self._enabled = False
             log.warning(
@@ -72,6 +74,7 @@ class DoclingEngine:
         """Release the converter and chunker."""
         self._converter = None
         self._chunker = None
+        self._stream = None
 
     async def health(self) -> bool:
         """True when Docling is enabled and loaded."""
@@ -79,15 +82,15 @@ class DoclingEngine:
 
     def _require(self) -> None:
         if not self._enabled:
-            raise DoclingUnavailable("Docling is disabled or not installed (uv sync --extra docling)")
+            raise DoclingUnavailable(
+                "Docling is disabled or not installed (uv sync --extra docling)"
+            )
         if self._converter is None:
             raise DoclingUnavailable("Docling has not been started")
 
     def _convert(self, data: bytes, filename: str) -> Any:
-        from docling_core.types.io import DocumentStream
-
         try:
-            result = self._converter.convert(DocumentStream(name=filename, stream=BytesIO(data)))
+            result = self._converter.convert(self._stream(name=filename, stream=BytesIO(data)))
         except Exception as exc:  # docling raises a family of conversion errors
             raise DoclingFailed(f"Docling could not convert {filename!r}: {exc}") from exc
         return result.document

@@ -58,19 +58,25 @@ async def test_calls_before_startup_are_unavailable() -> None:
 
 async def test_shutdown_makes_the_engine_unhealthy_again() -> None:
     engine = DoclingEngine(enabled=True)
-    engine._converter, engine._chunker = object(), object()
+    engine._converter, engine._chunker, engine._stream = object(), object(), object()
     assert await engine.health() is True
     await engine.shutdown()
     assert await engine.health() is False
 
 
-async def test_conversion_errors_surface_as_docling_failed() -> None:
+async def test_conversion_errors_surface_as_docling_failed(hide_docling: None) -> None:
+    """A failed conversion raises DoclingFailed — and does so without importing Docling,
+    which is what proves the engine touches the package only at startup."""
+
     class _Boom:
         def convert(self, *_: object, **__: object) -> object:
             raise RuntimeError("bad pdf")
 
+    class _Stream:
+        def __init__(self, **_: object) -> None: ...
+
     engine = DoclingEngine(enabled=True)
-    engine._converter, engine._chunker = _Boom(), object()
+    engine._converter, engine._chunker, engine._stream = _Boom(), object(), _Stream
     with pytest.raises(DoclingFailed, match="could not convert"):
         await engine.chunk_hybrid_file(b"not a pdf", "x.pdf")
 
@@ -101,7 +107,9 @@ async def test_real_docling_chunks_markdown() -> None:
     await engine.startup()
     assert await engine.health() is True, "install the extra: uv sync --extra docling"
 
-    chunks = await engine.chunk_text_hybrid("# Title\n\nFirst paragraph.\n\n## Second\n\nMore text.")
+    chunks = await engine.chunk_text_hybrid(
+        "# Title\n\nFirst paragraph.\n\n## Second\n\nMore text."
+    )
     assert chunks and all(c["text"].strip() for c in chunks)
     await engine.shutdown()
 
