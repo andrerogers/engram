@@ -63,10 +63,9 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-    "integration: tests that require external services (Docling sidecar fixtures)",
     "docling: tests that run real Docling in-process (needs `uv sync --extra docling`)",
 ]
-addopts = "-m 'not integration and not docling'"
+addopts = "-m 'not docling'"
 
 [tool.uv]
 python-preference = "only-managed"
@@ -74,7 +73,6 @@ python-preference = "only-managed"
 [tool.taskipy.tasks]
 dev      = "uvicorn engram.app:app --reload --port 8613"
 test     = "pytest -v -s"
-integration = "pytest -v -s -m integration"
 test-all = "pytest -v -s -m ''"
 lint     = "ruff check ."
 typecheck = "mypy engram"

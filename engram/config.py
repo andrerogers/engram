@@ -27,12 +27,8 @@ CHUNK_SIZE_TOKENS: int = 512
 CHUNK_OVERLAP_TOKENS: int = 64
 EMBEDDING_BATCH_SIZE: int = 100
 
-# Docling sidecar
-DOCLING_URL: str = os.environ.get("DOCLING_URL", "http://localhost:5001")
+# Docling runs in-process (optional extra); false forces the tiktoken fallback.
 DOCLING_ENABLED: bool = os.environ.get("DOCLING_ENABLED", "true").lower() == "true"
-DOCLING_TIMEOUT: float = float(os.environ.get("DOCLING_TIMEOUT", "120.0"))
-DOCLING_POLL_INTERVAL: float = float(os.environ.get("DOCLING_POLL_INTERVAL", "2.0"))
-DOCLING_MAX_WAIT: float = float(os.environ.get("DOCLING_MAX_WAIT", "600.0"))
 
 # Ingest job settings
 MAX_CONCURRENT_INGEST_JOBS: int = int(os.environ.get("MAX_CONCURRENT_INGEST_JOBS", "4"))
