@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from engram.clients.docling import DoclingClient, DoclingUnavailable
+from engram.clients.docling import DoclingEngine, DoclingUnavailable
 from engram.processors.base import ChunkCandidate, ChunkerKind, Modality
 
 log = logging.getLogger(__name__)
@@ -18,12 +18,12 @@ log = logging.getLogger(__name__)
 class DoclingTextProcessor:
     """Async text processor that uses Docling hybrid chunking.
 
-    Constructed with a shared ``DoclingClient``.  On ``DoclingUnavailable``
+    Constructed with a shared ``DoclingEngine``.  On ``DoclingUnavailable``
     the processor transparently falls back to tiktoken so callers do not
     need conditional logic.
     """
 
-    def __init__(self, client: DoclingClient) -> None:
+    def __init__(self, client: DoclingEngine) -> None:
         self._client = client
 
     async def process(self, text: str) -> list[ChunkCandidate]:

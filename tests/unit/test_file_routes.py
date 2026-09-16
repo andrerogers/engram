@@ -293,7 +293,7 @@ def test_document_original_404_when_no_object_key() -> None:
 def test_object_passthrough_returns_bytes() -> None:
     obj = _mock_object_store()
 
-    with patch(_OBJECT_STORE, obj), patch("engram.app.MINIO_ENABLED", False):
+    with patch(_OBJECT_STORE, obj):
         r = client.get(f"/documents/_object/{_OBJECT_KEY}")
 
     assert r.status_code == 200
@@ -304,19 +304,20 @@ def test_object_passthrough_404_for_missing_key() -> None:
     obj = _mock_object_store()
     obj.get = AsyncMock(side_effect=KeyError("not found"))
 
-    with patch(_OBJECT_STORE, obj), patch("engram.app.MINIO_ENABLED", False):
+    with patch(_OBJECT_STORE, obj):
         r = client.get("/documents/_object/uploads/missing/key.pdf")
 
     assert r.status_code == 404
 
 
-def test_object_passthrough_disabled_with_minio() -> None:
+def test_object_passthrough_rejects_a_traversing_key() -> None:
     obj = _mock_object_store()
+    obj.get = AsyncMock(side_effect=ValueError("escapes the object store"))
 
-    with patch(_OBJECT_STORE, obj), patch("engram.app.MINIO_ENABLED", True):
-        r = client.get(f"/documents/_object/{_OBJECT_KEY}")
+    with patch(_OBJECT_STORE, obj):
+        r = client.get("/documents/_object/../../etc/passwd")
 
-    assert r.status_code == 404
+    assert r.status_code in (400, 404)
 
 
 # ---------------------------------------------------------------------------

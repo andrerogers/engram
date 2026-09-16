@@ -7,18 +7,18 @@ propagates to the caller (the E9 job runner marks the job as failed).
 
 from __future__ import annotations
 
-from engram.clients.docling import DoclingClient
+from engram.clients.docling import DoclingEngine
 from engram.processors.base import ChunkCandidate, ChunkerKind, Modality
 
 
 class DoclingFileProcessor:
     """Async file processor that uses Docling hybrid chunking.
 
-    Constructed with a shared ``DoclingClient``.  ``DoclingUnavailable``
+    Constructed with a shared ``DoclingEngine``.  ``DoclingUnavailable``
     propagates to callers — binary files cannot be chunked without Docling.
     """
 
-    def __init__(self, client: DoclingClient) -> None:
+    def __init__(self, client: DoclingEngine) -> None:
         self._client = client
 
     async def process(self, data: bytes, filename: str) -> list[ChunkCandidate]:
@@ -26,7 +26,7 @@ class DoclingFileProcessor:
 
         Raises:
             DoclingUnavailable: when Docling is disabled or unreachable.
-            DoclingTaskFailed:  when Docling fails to process the file.
+            DoclingFailed:  when Docling fails to process the file.
         """
         raw_chunks = await self._client.chunk_hybrid_file(file_bytes=data, filename=filename)
         return [

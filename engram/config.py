@@ -9,9 +9,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ENGRAM_DB_PATH: Path = Path(
-    os.environ.get("ENGRAM_DB_PATH") or Path.home() / ".brainstack" / "engram.db"
-)
+BRAINSTACK_HOME: Path = Path(
+    os.environ.get("BRAINSTACK_HOME") or Path.home() / ".brainstack"
+).expanduser()
+ENGRAM_DB_PATH: Path = Path(os.environ.get("ENGRAM_DB_PATH") or BRAINSTACK_HOME / "engram.db")
+ENGRAM_OBJECT_DIR: Path = Path(
+    os.environ.get("ENGRAM_OBJECT_DIR") or BRAINSTACK_HOME / "objects"
+).expanduser()
 ENGRAM_PORT: int = int(os.environ.get("ENGRAM_PORT", "8613"))
 OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_EMBEDDINGS_URL: str = "https://openrouter.ai/api/v1/embeddings"
@@ -29,13 +33,6 @@ DOCLING_ENABLED: bool = os.environ.get("DOCLING_ENABLED", "true").lower() == "tr
 DOCLING_TIMEOUT: float = float(os.environ.get("DOCLING_TIMEOUT", "120.0"))
 DOCLING_POLL_INTERVAL: float = float(os.environ.get("DOCLING_POLL_INTERVAL", "2.0"))
 DOCLING_MAX_WAIT: float = float(os.environ.get("DOCLING_MAX_WAIT", "600.0"))
-
-# MinIO object storage
-MINIO_ENDPOINT: str = os.environ.get("MINIO_ENDPOINT", "http://localhost:9000")
-MINIO_ACCESS_KEY: str = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY: str = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
-MINIO_BUCKET: str = os.environ.get("MINIO_BUCKET", "engram")
-MINIO_ENABLED: bool = os.environ.get("MINIO_ENABLED", "false").lower() == "true"
 
 # Ingest job settings
 MAX_CONCURRENT_INGEST_JOBS: int = int(os.environ.get("MAX_CONCURRENT_INGEST_JOBS", "4"))
