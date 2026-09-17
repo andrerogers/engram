@@ -211,3 +211,78 @@ def test_delete_collection_not_found() -> None:
     with patch(_STORE, store):
         r = client.delete("/collections/nonexistent")
     assert r.status_code == 404
+
+
+# ── Facts ─────────────────────────────────────────────────────────────────
+
+
+def _fact(fact_id: str = "f1", **over: object) -> dict[str, object]:
+    return {
+        "id": fact_id,
+        "workspace_id": "ws-1",
+        "content": "uses uv",
+        "tags": [],
+        "source": None,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "pinned": False,
+        **over,
+    }
+
+
+def test_list_facts() -> None:
+    store = _mock_store()
+    store.list_facts = AsyncMock(return_value=[_fact(pinned=True)])
+    with patch(_STORE, store):
+        r = client.get("/facts", params={"workspace_id": "ws-1", "pinned_only": True, "limit": 10})
+    assert r.status_code == 200
+    assert r.json() == [_fact(pinned=True, score=0.0)]
+    store.list_facts.assert_awaited_once_with("ws-1", pinned_only=True, limit=10, offset=0)
+
+
+def test_get_fact_and_missing_fact() -> None:
+    store = _mock_store()
+    store.get_fact = AsyncMock(side_effect=[_fact(), None])
+    with patch(_STORE, store):
+        assert client.get("/facts/f1").json()["content"] == "uses uv"
+        assert client.get("/facts/gone").status_code == 404
+
+
+def test_pinning_a_fact_does_not_re_embed_it() -> None:
+    """Re-embedding on every pin would spend an API call on a change that is not about content."""
+    store = _mock_store()
+    store.set_fact_pinned = AsyncMock(return_value=True)
+    store.get_fact = AsyncMock(return_value=_fact(pinned=True))
+    with patch(_STORE, store), patch(_EMBED, new=AsyncMock()) as embed:
+        r = client.patch("/facts/f1", json={"pinned": True})
+    assert r.status_code == 200
+    assert r.json()["pinned"] is True
+    store.set_fact_pinned.assert_awaited_once_with("f1", pinned=True)
+    embed.assert_not_awaited()
+    store.upsert_fact.assert_not_awaited()
+
+
+def test_editing_a_fact_re_embeds_it_and_keeps_its_workspace() -> None:
+    """An edited fact whose vector still points at the old wording is recalled by the old wording."""
+    store = _mock_store()
+    store.get_fact = AsyncMock(side_effect=[_fact(), _fact(content="uses uv 0.9")])
+    with patch(_STORE, store), patch(_EMBED, new=AsyncMock(return_value=[[0.1, 0.2]])):
+        r = client.patch("/facts/f1", json={"content": "uses uv 0.9"})
+    assert r.status_code == 200
+    assert r.json()["content"] == "uses uv 0.9"
+    store.upsert_fact.assert_awaited_once_with(
+        fact_id="f1",
+        workspace_id="ws-1",
+        content="uses uv 0.9",
+        tags=[],
+        source=None,
+        embedding=[0.1, 0.2],
+    )
+
+
+def test_patch_with_nothing_to_change_is_rejected() -> None:
+    store = _mock_store()
+    store.get_fact = AsyncMock(return_value=None)
+    with patch(_STORE, store):
+        assert client.patch("/facts/f1", json={}).status_code == 400
+        assert client.patch("/facts/gone", json={"pinned": True}).status_code == 404

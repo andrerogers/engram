@@ -36,6 +36,16 @@ async def store(tmp_path: Path) -> AsyncIterator[Store]:
     await s.close()
 
 
+def _backdate(store: Store, created_at: dict[str, str]) -> None:
+    """Rows created microseconds apart do not order reliably by timestamp."""
+    store._execute(
+        lambda c: [
+            c.execute("UPDATE facts SET created_at = ? WHERE id = ?", (when, fact_id))
+            for fact_id, when in created_at.items()
+        ]
+    )
+
+
 def _count(store: Store, table: str) -> int:
     return store._execute(lambda c: c.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
 
@@ -234,6 +244,48 @@ async def test_fact_without_embedding_is_stored_but_not_recallable(store: Store)
     assert _count(store, "facts") == 1
     assert await store.delete_fact("f1") is True
     assert await store.delete_fact("f1") is False
+
+
+async def test_listing_facts_is_browsable_without_a_query(store: Store) -> None:
+    """Recall needs a question. An inspector opens on everything, newest first, pinned on top."""
+    await store.upsert_fact("f1", "ws", "oldest", [], None, _vec(1))
+    await store.upsert_fact("f2", "ws", "middle", [], None, None)
+    await store.upsert_fact("f3", "ws", "newest", [], None, _vec(0, 1))
+    await store.upsert_fact("f4", "other", "unrelated", [], None, _vec(1))
+    _backdate(store, {"f1": "2026-01-01T00:00:00+00:00", "f2": "2026-02-01T00:00:00+00:00"})
+
+    listed = await store.list_facts("ws")
+    assert [f["id"] for f in listed] == ["f3", "f2", "f1"]
+
+    # A fact with no embedding is invisible to recall but must still be listable — otherwise the
+    # one memory you cannot search for is also the one you cannot find and delete.
+    assert "f2" in [f["id"] for f in listed]
+
+    assert await store.set_fact_pinned("f1", pinned=True) is True
+    assert [f["id"] for f in await store.list_facts("ws")] == ["f1", "f3", "f2"]
+    assert await store.list_facts("ws", pinned_only=True) == [await store.get_fact("f1")]
+
+    page = await store.list_facts("ws", limit=1, offset=1)
+    assert [f["id"] for f in page] == ["f3"]
+
+
+async def test_a_fact_reports_its_pin_everywhere_it_can_be_read(store: Store) -> None:
+    await store.upsert_fact("f1", "ws", "uses uv", ["tooling"], "session", _vec(1))
+    await store.set_fact_pinned("f1", pinned=True)
+
+    [recalled] = await store.recall_facts("ws", _vec(1), k=5)
+    assert recalled["pinned"] is True
+    fact = await store.get_fact("f1")
+    assert fact is not None and fact["pinned"] is True and fact["content"] == "uses uv"
+
+    # Rewriting the content leaves the pin alone: pinning is the user's decision about a fact,
+    # not part of the fact.
+    await store.upsert_fact("f1", "ws", "uses uv 0.9", ["tooling"], "session", _vec(1))
+    fact = await store.get_fact("f1")
+    assert fact is not None and fact["pinned"] is True
+
+    assert await store.set_fact_pinned("missing", pinned=True) is False
+    assert await store.get_fact("missing") is None
 
 
 async def test_signals_filter_by_type_and_ignore_duplicate_ids(store: Store) -> None:

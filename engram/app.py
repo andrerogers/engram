@@ -49,11 +49,21 @@ class FactIn(BaseModel):
 
 class FactOut(BaseModel):
     id: str
+    workspace_id: str
     content: str
     tags: list[str]
     source: str | None
     created_at: str | None
+    updated_at: str | None = None
+    pinned: bool = False
     score: float = 0.0
+
+
+class FactPatch(BaseModel):
+    """Both fields optional, but a patch that changes nothing is a client error, not a no-op."""
+
+    content: str | None = None
+    pinned: bool | None = None
 
 
 class SignalIn(BaseModel):
@@ -383,6 +393,62 @@ async def recall_facts(
         raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
     rows = await store.recall_facts(workspace_id=workspace_id, embedding=vecs[0], k=k)
     return [FactOut(**r) for r in rows]
+
+
+@app.get("/facts", response_model=list[FactOut])
+async def list_facts(
+    workspace_id: str = Query(...),
+    pinned_only: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[FactOut]:
+    """Browse a workspace's facts — pinned first, then newest. No query, no embedding call."""
+    store = _get_store()
+    rows = await store.list_facts(workspace_id, pinned_only=pinned_only, limit=limit, offset=offset)
+    return [FactOut(**r) for r in rows]
+
+
+@app.get("/facts/{fact_id}", response_model=FactOut)
+async def get_fact(fact_id: str) -> FactOut:
+    """Return one fact by ID."""
+    row = await _get_store().get_fact(fact_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Fact not found")
+    return FactOut(**row)
+
+
+@app.patch("/facts/{fact_id}", response_model=FactOut)
+async def patch_fact(fact_id: str, req: FactPatch) -> FactOut:
+    """Edit a fact's content, pin it, or both.
+
+    A content edit re-embeds: a fact whose vector still describes the old wording is recalled
+    by the words it no longer contains. A pin never embeds — it says nothing about the content.
+    """
+    if req.content is None and req.pinned is None:
+        raise HTTPException(status_code=400, detail="Nothing to change")
+    store = _get_store()
+    fact = await store.get_fact(fact_id)
+    if fact is None:
+        raise HTTPException(status_code=404, detail="Fact not found")
+    if req.content is not None:
+        try:
+            vecs = await embeddings.embed([req.content])
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
+        await store.upsert_fact(
+            fact_id=fact_id,
+            workspace_id=fact["workspace_id"],
+            content=req.content,
+            tags=fact["tags"],
+            source=fact["source"],
+            embedding=vecs[0],
+        )
+    if req.pinned is not None:
+        await store.set_fact_pinned(fact_id, pinned=req.pinned)
+    updated = await store.get_fact(fact_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Fact not found")
+    return FactOut(**updated)
 
 
 @app.delete("/facts/{fact_id}", status_code=204)
