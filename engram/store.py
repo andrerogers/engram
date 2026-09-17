@@ -114,11 +114,32 @@ def _migrations(dimensions: int) -> tuple[str, ...]:
         CREATE TRIGGER signals_drop_vector AFTER DELETE ON signals
             BEGIN DELETE FROM signal_vectors WHERE signal_id = old.id; END;
         """,
+        """
+        ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+        """,
     )
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+_FACT_COLUMNS = (
+    "SELECT id, workspace_id, content, tags, source, created_at, updated_at, pinned FROM facts"
+)
+
+
+def _fact(row: tuple[Any, ...]) -> dict[str, Any]:
+    return {
+        "id": row[0],
+        "workspace_id": row[1],
+        "content": row[2],
+        "tags": json.loads(row[3]),
+        "source": row[4],
+        "created_at": row[5],
+        "updated_at": row[6],
+        "pinned": bool(row[7]),
+    }
 
 
 def _job(row: tuple[Any, ...], with_hash: bool) -> dict[str, Any]:
@@ -570,23 +591,57 @@ class Store:
             hits = FACTS.similarity_search(c, workspace_id, embedding, k)
             results = []
             for fact_id, score in hits:
-                r = c.execute(
-                    "SELECT id, content, tags, source, created_at FROM facts WHERE id = ?",
-                    (fact_id,),
-                ).fetchone()
-                results.append(
-                    {
-                        "id": r[0],
-                        "content": r[1],
-                        "tags": json.loads(r[2]),
-                        "source": r[3],
-                        "created_at": r[4],
-                        "score": score,
-                    }
-                )
+                r = c.execute(_FACT_COLUMNS + " WHERE id = ?", (fact_id,)).fetchone()
+                results.append({**_fact(r), "score": score})
             return results
 
         return await self._run(_do)
+
+    async def get_fact(self, fact_id: str) -> dict[str, Any] | None:
+        """Return one fact by id, or None."""
+
+        def _do(c: sqlite3.Connection) -> dict[str, Any] | None:
+            row = c.execute(_FACT_COLUMNS + " WHERE id = ?", (fact_id,)).fetchone()
+            return _fact(row) if row else None
+
+        return await self._run(_do)
+
+    async def list_facts(
+        self,
+        workspace_id: str,
+        *,
+        pinned_only: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Browse a workspace's facts, pinned first then newest.
+
+        Recall answers a question; this answers "what do you remember about me", which has no
+        query, and must reach facts whose embedding failed and which recall can never return.
+        """
+        where = " WHERE workspace_id = ?" + (" AND pinned = 1" if pinned_only else "")
+
+        def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = c.execute(
+                _FACT_COLUMNS
+                + where
+                + " ORDER BY pinned DESC, created_at DESC, id LIMIT ? OFFSET ?",
+                (workspace_id, limit, offset),
+            ).fetchall()
+            return [_fact(r) for r in rows]
+
+        return await self._run(_do)
+
+    async def set_fact_pinned(self, fact_id: str, *, pinned: bool) -> bool:
+        """Pin or unpin a fact. Returns True if the fact existed."""
+        return await self._run(
+            lambda c: (
+                c.execute(
+                    "UPDATE facts SET pinned = ? WHERE id = ?", (int(pinned), fact_id)
+                ).rowcount
+                > 0
+            )
+        )
 
     async def delete_fact(self, fact_id: str) -> bool:
         """Delete a fact by ID. Returns True if deleted."""

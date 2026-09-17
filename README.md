@@ -35,6 +35,12 @@ Hive calls Engram directly over HTTP — Cortex does not proxy these calls.
 | `GET` | `/retrieve` | Semantic search — `?q=...&collection_id=...&k=5` |
 | `GET` | `/collections` | List collections (filter: `?workspace_id=...`) |
 | `DELETE` | `/collections/{id}` | Delete collection and all its chunks |
+| `POST` | `/facts` | Store a distilled fact (embedded on write) |
+| `GET` | `/facts` | Browse a workspace's facts — pinned first, then newest. No query needed |
+| `GET` | `/facts/recall` | Semantic fact recall — `?q=...&workspace_id=...&k=5` |
+| `GET` | `/facts/{id}` | Read one fact |
+| `PATCH` | `/facts/{id}` | Edit content (re-embeds) and/or pin it (does not) |
+| `DELETE` | `/facts/{id}` | Forget a fact |
 
 > File ingestion routes (`POST /index/file`, `/documents/*`) land in E10–E11.
 
