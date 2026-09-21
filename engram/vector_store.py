@@ -40,6 +40,12 @@ class VectorStore(Protocol):
         """Return ``(item_id, cosine similarity)`` pairs, most similar first."""
         ...
 
+    def similarity(
+        self, conn: sqlite3.Connection, item_id: str, embedding: Sequence[float]
+    ) -> float | None:
+        """Cosine similarity of one stored item to *embedding*, or None if it has no vector."""
+        ...
+
 
 class SqliteVecStore:
     def __init__(
@@ -115,6 +121,15 @@ class SqliteVecStore:
             params,
         ).fetchall()
         return [(row[0], 1.0 - float(row[1])) for row in rows]
+
+    def similarity(
+        self, conn: sqlite3.Connection, item_id: str, embedding: Sequence[float]
+    ) -> float | None:
+        row = conn.execute(
+            f"SELECT vec_distance_cosine(embedding, ?) FROM {self.table} WHERE {self._id} = ?",
+            (json.dumps(list(embedding)), item_id),
+        ).fetchone()
+        return None if row is None else 1.0 - float(row[0])
 
 
 CHUNKS = SqliteVecStore("chunk_vectors", "chunk_id", "collection_id", ("modality",))

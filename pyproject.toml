@@ -1,6 +1,6 @@
 [project]
 name = "engram"
-version = "0.3.0"
+version = "0.4.0"
 description = "RAG service for brainstack — document indexing, vector retrieval"
 requires-python = ">=3.13"
 dependencies = [
