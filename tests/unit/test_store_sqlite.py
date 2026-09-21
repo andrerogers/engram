@@ -313,3 +313,129 @@ async def test_everything_survives_reopening_the_file(tmp_path: Path) -> None:
     reopened = Store(path, dimensions=DIMS)
     assert [r["content"] for r in await reopened.retrieve(_vec(1), cid)] == ["kept"]
     await reopened.close()
+
+
+# ── Hybrid retrieval ──────────────────────────────────────────────────────
+
+
+async def test_a_query_finds_an_identifier_the_vectors_rank_last(store: Store) -> None:
+    """The case hybrid retrieval exists for: the embedding points elsewhere, the name is exact."""
+    cid = await store.get_or_create_collection("ws", "code")
+    await store.index_document(
+        cid,
+        "/a.py",
+        None,
+        [_chunk(0, "def route_web_socket(conn): ..."), _chunk(1, "websockets overview")],
+        [_vec(0, 1), _vec(1, 0)],
+    )
+
+    dense_only = await store.retrieve(_vec(1, 0), cid, k=1)
+    hybrid = await store.retrieve(_vec(1, 0), cid, k=2, query="route_web_socket")
+
+    assert [r["content"] for r in dense_only] == ["websockets overview"]
+    assert hybrid[0]["content"] == "def route_web_socket(conn): ..."
+    # score stays cosine similarity even for a chunk found lexically.
+    assert hybrid[0]["score"] == pytest.approx(0.0, abs=1e-6)
+
+
+async def test_an_identifier_is_one_token_not_its_parts(store: Store) -> None:
+    cid = await store.get_or_create_collection("ws", "code")
+    await store.index_document(
+        cid, "/a.py", None, [_chunk(0, "workspace path handling")], [_vec(1, 0)]
+    )
+    # With "_" kept inside tokens, workspace_path is not "workspace" followed by "path".
+    hits = store._execute(
+        lambda c: c.execute(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH '\"workspace_path\"'"
+        ).fetchone()[0]
+    )
+    assert hits == 0
+
+
+async def test_lexical_search_stays_inside_the_collection(store: Store) -> None:
+    cid = await store.get_or_create_collection("ws", "a")
+    other = await store.get_or_create_collection("ws", "b")
+    await store.index_document(cid, "/a.md", None, [_chunk(0, "nothing here")], [_vec(1, 0)])
+    await store.index_document(other, "/b.md", None, [_chunk(0, "needle_token")], [_vec(1, 0)])
+
+    results = await store.retrieve(_vec(0, 1), cid, k=5, query="needle_token")
+
+    assert [r["document_path"] for r in results] == ["/a.md"]
+
+
+async def test_deleting_a_document_removes_it_from_the_lexical_index(store: Store) -> None:
+    cid = await store.get_or_create_collection("ws", "a")
+    doc, _ = await store.index_document(
+        cid, "/a.md", None, [_chunk(0, "ephemeral_marker")], [_vec(1, 0)]
+    )
+    await store.delete_document(doc)
+    assert _count(store, "chunks") == 0
+    assert (
+        store._execute(
+            lambda c: c.execute(
+                "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'ephemeral_marker'"
+            ).fetchone()[0]
+        )
+        == 0
+    )
+
+
+async def test_a_fact_with_no_vector_is_reachable_by_its_words(store: Store) -> None:
+    """Its embedding call failed, so vector recall can never return it. The words still can."""
+    await store.upsert_fact("f1", "ws", "deploys go through ArgoCD", [], None, None)
+
+    assert await store.recall_facts("ws", _vec(1), k=5) == []
+    [hit] = await store.recall_facts("ws", _vec(1), k=5, query="ArgoCD")
+    assert hit["id"] == "f1" and hit["score"] == 0.0
+
+
+async def test_editing_a_fact_reindexes_its_words(store: Store) -> None:
+    await store.upsert_fact("f1", "ws", "uses poetry", [], None, None)
+    await store.upsert_fact("f1", "ws", "uses uv", [], None, None)
+
+    assert await store.recall_facts("ws", _vec(1), query="poetry") == []
+    assert [f["id"] for f in await store.recall_facts("ws", _vec(1), query="uv")] == ["f1"]
+
+
+async def test_lexical_fact_recall_stays_inside_the_workspace(store: Store) -> None:
+    await store.upsert_fact("f1", "other", "secret_codename", [], None, None)
+    assert await store.recall_facts("ws", _vec(1), query="secret_codename") == []
+
+
+async def test_upgrading_an_existing_database_indexes_what_is_already_there(
+    tmp_path: Path,
+) -> None:
+    """The migration's backfill: rows written before the lexical index existed are searchable."""
+    from engram.store import _migrations
+
+    path = tmp_path / "engram.db"
+    old = Store(path, dimensions=DIMS)
+    await old.init_db()
+    cid = await old.get_or_create_collection("ws", "a")
+    await old.index_document(cid, "/a.md", None, [_chunk(0, "legacy_marker")], [_vec(1, 0)])
+    await old.upsert_fact("f1", "ws", "legacy_fact_marker", [], None, None)
+    # Wind the file back to before the lexical migration, as a database from the last release.
+    migrations = _migrations(DIMS)
+    old._execute(
+        lambda c: [
+            c.execute("DROP TRIGGER chunks_fts_insert"),
+            c.execute("DROP TRIGGER chunks_fts_delete"),
+            c.execute("DROP TRIGGER chunks_fts_update"),
+            c.execute("DROP TRIGGER facts_fts_insert"),
+            c.execute("DROP TRIGGER facts_fts_delete"),
+            c.execute("DROP TRIGGER facts_fts_update"),
+            c.execute("DROP TABLE chunks_fts"),
+            c.execute("DROP TABLE facts_fts"),
+        ]
+    )
+    old._execute(lambda c: c.execute(f"PRAGMA user_version = {len(migrations) - 1}"))
+    await old.close()
+
+    upgraded = Store(path, dimensions=DIMS)
+    await upgraded.init_db()
+    hits = await upgraded.retrieve(_vec(0, 1), cid, k=5, query="legacy_marker")
+    facts = await upgraded.recall_facts("ws", _vec(1), query="legacy_fact_marker")
+    await upgraded.close()
+
+    assert [h["content"] for h in hits] == ["legacy_marker"]
+    assert [f["id"] for f in facts] == ["f1"]

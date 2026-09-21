@@ -200,6 +200,7 @@ async def retrieve(
         collection_id=collection_id,
         k=k,
         modalities=modalities,
+        query=q,
     )
     return RetrieveResponse(results=[RetrieveResult(**r) for r in results])
 
@@ -391,7 +392,7 @@ async def recall_facts(
         vecs = await embeddings.embed([q])
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
-    rows = await store.recall_facts(workspace_id=workspace_id, embedding=vecs[0], k=k)
+    rows = await store.recall_facts(workspace_id=workspace_id, embedding=vecs[0], k=k, query=q)
     return [FactOut(**r) for r in rows]
 
 

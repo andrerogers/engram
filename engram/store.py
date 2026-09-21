@@ -22,6 +22,7 @@ from typing import Any, TypeVar
 import sqlite_vec
 
 from engram.clients.storage.base import ObjectStore
+from engram.hybrid import CANDIDATE_FACTOR, TOKENIZE, fts_query, fuse
 from engram.processors.base import ChunkCandidate
 from engram.vector_store import CHUNKS, FACTS, SIGNALS
 
@@ -116,6 +117,44 @@ def _migrations(dimensions: int) -> tuple[str, ...]:
         """,
         """
         ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+        """,
+        # Lexical indexes for hybrid retrieval (engram.hybrid). External-content tables keyed on
+        # the implicit rowid: VACUUM may renumber rowids of a table without an INTEGER PRIMARY
+        # KEY, so anything that vacuums must follow with INSERT INTO <x>_fts(<x>_fts)
+        # VALUES ('rebuild').
+        f"""
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+            content, content='chunks', content_rowid='rowid', tokenize="{TOKENIZE}"
+        );
+        INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild');
+        CREATE TRIGGER chunks_fts_insert AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts (rowid, content) VALUES (new.rowid, new.content);
+        END;
+        CREATE TRIGGER chunks_fts_delete AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts (chunks_fts, rowid, content)
+                VALUES ('delete', old.rowid, old.content);
+        END;
+        CREATE TRIGGER chunks_fts_update AFTER UPDATE OF content ON chunks BEGIN
+            INSERT INTO chunks_fts (chunks_fts, rowid, content)
+                VALUES ('delete', old.rowid, old.content);
+            INSERT INTO chunks_fts (rowid, content) VALUES (new.rowid, new.content);
+        END;
+        CREATE VIRTUAL TABLE facts_fts USING fts5(
+            content, content='facts', content_rowid='rowid', tokenize="{TOKENIZE}"
+        );
+        INSERT INTO facts_fts (facts_fts) VALUES ('rebuild');
+        CREATE TRIGGER facts_fts_insert AFTER INSERT ON facts BEGIN
+            INSERT INTO facts_fts (rowid, content) VALUES (new.rowid, new.content);
+        END;
+        CREATE TRIGGER facts_fts_delete AFTER DELETE ON facts BEGIN
+            INSERT INTO facts_fts (facts_fts, rowid, content)
+                VALUES ('delete', old.rowid, old.content);
+        END;
+        CREATE TRIGGER facts_fts_update AFTER UPDATE OF content ON facts BEGIN
+            INSERT INTO facts_fts (facts_fts, rowid, content)
+                VALUES ('delete', old.rowid, old.content);
+            INSERT INTO facts_fts (rowid, content) VALUES (new.rowid, new.content);
+        END;
         """,
     )
 
@@ -584,15 +623,36 @@ class Store:
         workspace_id: str,
         embedding: list[float],
         k: int = 5,
+        query: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the top-k facts nearest to *embedding* for the given workspace."""
+        """Return the top-k facts for the given workspace.
+
+        With *query*, vector and BM25 results are fused (engram.hybrid) — which also reaches
+        facts whose embedding call failed, stored with no vector and invisible to vector search.
+        ``score`` is always cosine similarity, 0.0 for a fact that has no vector.
+        """
+        match = fts_query(query) if query else None
 
         def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
-            hits = FACTS.similarity_search(c, workspace_id, embedding, k)
+            depth = k * CANDIDATE_FACTOR if match else k
+            dense = [i for i, _ in FACTS.similarity_search(c, workspace_id, embedding, depth)]
+            ranked = dense
+            if match:
+                lexical = [
+                    row[0]
+                    for row in c.execute(
+                        "SELECT f.id FROM facts_fts x JOIN facts f ON f.rowid = x.rowid "
+                        "WHERE facts_fts MATCH ? AND f.workspace_id = ? "
+                        "ORDER BY bm25(facts_fts) LIMIT ?",
+                        (match, workspace_id, depth),
+                    )
+                ]
+                ranked = fuse(dense, lexical)
             results = []
-            for fact_id, score in hits:
+            for fact_id in ranked[:k]:
                 r = c.execute(_FACT_COLUMNS + " WHERE id = ?", (fact_id,)).fetchone()
-                results.append({**_fact(r), "score": score})
+                score = FACTS.similarity(c, fact_id, embedding)
+                results.append({**_fact(r), "score": 0.0 if score is None else score})
             return results
 
         return await self._run(_do)
@@ -712,20 +772,45 @@ class Store:
         collection_id: str,
         k: int = 5,
         modalities: list[str] | None = None,
+        query: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Vector search chunks in a collection.
+        """Search chunks in a collection.
+
+        With *query*, vector and BM25 results are fused (engram.hybrid); without it, this is
+        vector search alone. ``score`` is always cosine similarity to *embedding*, including for
+        a chunk found only lexically — callers compare it against thresholds.
 
         Args:
             modalities: Filter to these modalities (default: ["text"]).
         """
         effective_modalities = modalities if modalities is not None else ["text"]
+        match = fts_query(query) if query else None
 
         def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
-            hits = CHUNKS.similarity_search(
-                c, collection_id, embedding, k, {"modality": effective_modalities}
-            )
+            depth = k * CANDIDATE_FACTOR if match else k
+            dense = [
+                chunk_id
+                for chunk_id, _ in CHUNKS.similarity_search(
+                    c, collection_id, embedding, depth, {"modality": effective_modalities}
+                )
+            ]
+            ranked = dense
+            if match and effective_modalities:
+                marks = ", ".join("?" * len(effective_modalities))
+                lexical = [
+                    row[0]
+                    for row in c.execute(
+                        "SELECT c.id FROM chunks_fts x JOIN chunks c ON c.rowid = x.rowid "
+                        "JOIN documents d ON d.id = c.document_id "
+                        f"WHERE chunks_fts MATCH ? AND d.collection_id = ? AND c.modality IN ({marks}) "
+                        "ORDER BY bm25(chunks_fts) LIMIT ?",
+                        (match, collection_id, *effective_modalities, depth),
+                    )
+                ]
+                ranked = fuse(dense, lexical)
             results = []
-            for chunk_id, score in hits:
+            for chunk_id in ranked[:k]:
+                score = CHUNKS.similarity(c, chunk_id, embedding) or 0.0
                 r = c.execute(
                     "SELECT c.id, d.path, c.content, c.modality, c.chunker FROM chunks c "
                     "JOIN documents d ON d.id = c.document_id WHERE c.id = ?",
