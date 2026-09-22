@@ -156,6 +156,14 @@ def _migrations(dimensions: int) -> tuple[str, ...]:
             INSERT INTO facts_fts (rowid, content) VALUES (new.rowid, new.content);
         END;
         """,
+        # A fact belongs to one project, or to none — which makes it the workspace's, shared by
+        # every project in it (TDD §5.1). The vector partition stays the workspace, so one search
+        # reaches both pools and the SQL below narrows to the asking project's own plus the
+        # shared ones.
+        """
+        ALTER TABLE facts ADD COLUMN project_id TEXT;
+        CREATE INDEX facts_project ON facts (workspace_id, project_id);
+        """,
     )
 
 
@@ -164,8 +172,18 @@ def _now() -> str:
 
 
 _FACT_COLUMNS = (
-    "SELECT id, workspace_id, content, tags, source, created_at, updated_at, pinned FROM facts"
+    "SELECT id, workspace_id, content, tags, source, created_at, updated_at, pinned, project_id "
+    "FROM facts"
 )
+
+# A fact with no project is the workspace's own pool: every project in it sees it. Asking with
+# no project means "the workspace and all of it", which is what an inspector or IRIS wants.
+_POOL_SQL = "(project_id IS NULL OR project_id = ?)"
+
+
+def _pool(project_id: str | None) -> tuple[str, tuple[Any, ...]]:
+    """The WHERE fragment and parameters that select a project's facts plus the shared pool."""
+    return (" AND " + _POOL_SQL, (project_id,)) if project_id else ("", ())
 
 
 def _fact(row: tuple[Any, ...]) -> dict[str, Any]:
@@ -178,6 +196,7 @@ def _fact(row: tuple[Any, ...]) -> dict[str, Any]:
         "created_at": row[5],
         "updated_at": row[6],
         "pinned": bool(row[7]),
+        "project_id": row[8],
     }
 
 
@@ -599,17 +618,19 @@ class Store:
         tags: list[str],
         source: str | None,
         embedding: list[float] | None,
+        project_id: str | None = None,
     ) -> None:
         """Insert or update a distilled fact. A fact without an embedding is not recallable."""
         now = _now()
 
         def _do(c: sqlite3.Connection) -> None:
             c.execute(
-                "INSERT INTO facts (id, workspace_id, content, tags, source, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET "
+                "INSERT INTO facts "
+                "(id, workspace_id, project_id, content, tags, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET "
                 "content = excluded.content, tags = excluded.tags, source = excluded.source, "
-                "updated_at = excluded.updated_at",
-                (fact_id, workspace_id, content, json.dumps(tags), source, now, now),
+                "project_id = excluded.project_id, updated_at = excluded.updated_at",
+                (fact_id, workspace_id, project_id, content, json.dumps(tags), source, now, now),
             )
             if embedding is None:
                 FACTS.delete(c, fact_id)
@@ -624,18 +645,31 @@ class Store:
         embedding: list[float],
         k: int = 5,
         query: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the top-k facts for the given workspace.
+        """Return the top-k facts a project can see: its own, plus the workspace's shared pool.
 
         With *query*, vector and BM25 results are fused (engram.hybrid) — which also reaches
         facts whose embedding call failed, stored with no vector and invisible to vector search.
         ``score`` is always cosine similarity, 0.0 for a fact that has no vector.
         """
         match = fts_query(query) if query else None
+        pool_sql, pool_params = _pool(project_id)
 
         def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
             depth = k * CANDIDATE_FACTOR if match else k
+            # The vectors are partitioned by workspace, so a project's own facts and the shared
+            # ones come back together — and so do other projects', which the pool filter drops.
             dense = [i for i, _ in FACTS.similarity_search(c, workspace_id, embedding, depth)]
+            if project_id:
+                visible = {
+                    row[0]
+                    for row in c.execute(
+                        "SELECT id FROM facts WHERE workspace_id = ?" + pool_sql,
+                        (workspace_id, *pool_params),
+                    )
+                }
+                dense = [i for i in dense if i in visible]
             ranked = dense
             if match:
                 lexical = [
@@ -643,8 +677,9 @@ class Store:
                     for row in c.execute(
                         "SELECT f.id FROM facts_fts x JOIN facts f ON f.rowid = x.rowid "
                         "WHERE facts_fts MATCH ? AND f.workspace_id = ? "
-                        "ORDER BY bm25(facts_fts) LIMIT ?",
-                        (match, workspace_id, depth),
+                        + pool_sql.replace("project_id", "f.project_id")
+                        + " ORDER BY bm25(facts_fts) LIMIT ?",
+                        (match, workspace_id, *pool_params, depth),
                     )
                 ]
                 ranked = fuse(dense, lexical)
@@ -673,20 +708,22 @@ class Store:
         pinned_only: bool = False,
         limit: int = 50,
         offset: int = 0,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Browse a workspace's facts, pinned first then newest.
+        """Browse the facts a project can see, pinned first then newest.
 
         Recall answers a question; this answers "what do you remember about me", which has no
         query, and must reach facts whose embedding failed and which recall can never return.
         """
-        where = " WHERE workspace_id = ?" + (" AND pinned = 1" if pinned_only else "")
+        pool_sql, pool_params = _pool(project_id)
+        where = " WHERE workspace_id = ?" + pool_sql + (" AND pinned = 1" if pinned_only else "")
 
         def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
             rows = c.execute(
                 _FACT_COLUMNS
                 + where
                 + " ORDER BY pinned DESC, created_at DESC, id LIMIT ? OFFSET ?",
-                (workspace_id, limit, offset),
+                (workspace_id, *pool_params, limit, offset),
             ).fetchall()
             return [_fact(r) for r in rows]
 

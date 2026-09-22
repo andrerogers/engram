@@ -426,9 +426,17 @@ async def test_upgrading_an_existing_database_indexes_what_is_already_there(
             c.execute("DROP TRIGGER facts_fts_update"),
             c.execute("DROP TABLE chunks_fts"),
             c.execute("DROP TABLE facts_fts"),
+            # Everything the migrations after the lexical one added, so the file really is the
+            # older schema. Rewinding the version alone re-runs them, and `ALTER TABLE ... ADD
+            # COLUMN` is not something you can run twice.
+            c.execute("DROP INDEX facts_project"),
+            c.execute("ALTER TABLE facts DROP COLUMN project_id"),
         ]
     )
-    old._execute(lambda c: c.execute(f"PRAGMA user_version = {len(migrations) - 1}"))
+    # The version before the lexical migration, found by what it creates rather than by
+    # counting from the end — which pointed at whichever migration was added last.
+    lexical = next(i for i, m in enumerate(migrations) if "chunks_fts USING fts5" in m)
+    old._execute(lambda c: c.execute(f"PRAGMA user_version = {lexical}"))
     await old.close()
 
     upgraded = Store(path, dimensions=DIMS)
@@ -439,3 +447,58 @@ async def test_upgrading_an_existing_database_indexes_what_is_already_there(
 
     assert [h["content"] for h in hits] == ["legacy_marker"]
     assert [f["id"] for f in facts] == ["f1"]
+
+
+# --- two pools: a project's facts, and the workspace's own -----------------------------------
+
+
+async def _pools(tmp_path: Path) -> Store:
+    store = Store(tmp_path / "engram.db", dimensions=DIMS)
+    await store.init_db()
+    await store.upsert_fact("shared", "ws", "the team deploys on Fridays", [], None, _vec(1, 0))
+    await store.upsert_fact(
+        "mine", "ws", "this service owns billing", [], None, _vec(1, 0), project_id="p1"
+    )
+    await store.upsert_fact(
+        "theirs", "ws", "this service owns search", [], None, _vec(1, 0), project_id="p2"
+    )
+    return store
+
+
+async def test_a_project_recalls_its_own_facts_and_the_shared_ones(tmp_path: Path) -> None:
+    store = await _pools(tmp_path)
+    found = await store.recall_facts("ws", _vec(1, 0), k=10, project_id="p1")
+    await store.close()
+    assert sorted(f["id"] for f in found) == ["mine", "shared"]
+
+
+async def test_another_projects_facts_are_not_visible(tmp_path: Path) -> None:
+    """The pool is what makes two projects in one workspace separate."""
+    store = await _pools(tmp_path)
+    found = await store.list_facts("ws", project_id="p1")
+    await store.close()
+    assert "theirs" not in [f["id"] for f in found]
+
+
+async def test_without_a_project_the_whole_workspace_answers(tmp_path: Path) -> None:
+    """What the memory inspector and a voice session with no project ask for."""
+    store = await _pools(tmp_path)
+    found = await store.list_facts("ws")
+    await store.close()
+    assert sorted(f["id"] for f in found) == ["mine", "shared", "theirs"]
+
+
+async def test_a_fact_remembers_which_pool_it_is_in(tmp_path: Path) -> None:
+    store = await _pools(tmp_path)
+    rows = {f["id"]: f["project_id"] for f in await store.list_facts("ws")}
+    await store.close()
+    assert rows == {"shared": None, "mine": "p1", "theirs": "p2"}
+
+
+async def test_the_lexical_half_of_recall_respects_the_pool(tmp_path: Path) -> None:
+    """Hybrid recall fuses BM25 with vectors; the filter has to cover both halves."""
+    store = await _pools(tmp_path)
+    found = await store.recall_facts("ws", _vec(0, 1), k=10, query="owns", project_id="p1")
+    await store.close()
+    ids = [f["id"] for f in found]
+    assert "mine" in ids and "theirs" not in ids
