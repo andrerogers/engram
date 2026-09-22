@@ -220,6 +220,7 @@ def _fact(fact_id: str = "f1", **over: object) -> dict[str, object]:
     return {
         "id": fact_id,
         "workspace_id": "ws-1",
+        "project_id": None,
         "content": "uses uv",
         "tags": [],
         "source": None,
@@ -237,7 +238,23 @@ def test_list_facts() -> None:
         r = client.get("/facts", params={"workspace_id": "ws-1", "pinned_only": True, "limit": 10})
     assert r.status_code == 200
     assert r.json() == [_fact(pinned=True, score=0.0)]
-    store.list_facts.assert_awaited_once_with("ws-1", pinned_only=True, limit=10, offset=0)
+    store.list_facts.assert_awaited_once_with(
+        "ws-1", pinned_only=True, limit=10, offset=0, project_id=None
+    )
+
+
+def test_listing_for_a_project_asks_for_its_pool() -> None:
+    """A project sees its own facts plus the workspace's shared ones — the store decides which,
+    so the route's job is to pass the project through rather than drop it."""
+    store = _mock_store()
+    store.list_facts = AsyncMock(return_value=[_fact(project_id="p1")])
+    with patch(_STORE, store):
+        r = client.get("/facts", params={"workspace_id": "ws-1", "project_id": "p1"})
+    assert r.status_code == 200
+    assert r.json()[0]["project_id"] == "p1"
+    store.list_facts.assert_awaited_once_with(
+        "ws-1", pinned_only=False, limit=50, offset=0, project_id="p1"
+    )
 
 
 def test_get_fact_and_missing_fact() -> None:

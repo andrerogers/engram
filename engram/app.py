@@ -42,6 +42,8 @@ from engram.models import (
 class FactIn(BaseModel):
     id: str | None = None
     workspace_id: str
+    # No project means the workspace's own pool, shared by every project in it.
+    project_id: str | None = None
     content: str
     tags: list[str] = []
     source: str | None = None
@@ -50,6 +52,7 @@ class FactIn(BaseModel):
 class FactOut(BaseModel):
     id: str
     workspace_id: str
+    project_id: str | None = None
     content: str
     tags: list[str]
     source: str | None
@@ -372,6 +375,7 @@ async def store_fact(req: FactIn) -> dict[str, str]:
     await store.upsert_fact(
         fact_id=fact_id,
         workspace_id=req.workspace_id,
+        project_id=req.project_id,
         content=req.content,
         tags=req.tags,
         source=req.source,
@@ -385,14 +389,21 @@ async def recall_facts(
     workspace_id: str = Query(...),
     q: str = Query(..., description="Query text for semantic search"),
     k: int = Query(default=5, ge=1, le=50),
+    project_id: str | None = Query(default=None, description="Narrow to this project + shared"),
 ) -> list[FactOut]:
-    """Recall the top-k distilled facts semantically nearest to query."""
+    """Recall the top-k facts nearest to query, from this project's pool and the shared one.
+
+    Without ``project_id`` the whole workspace answers — every project's facts and the shared
+    ones — which is what an inspector or a voice session with no project wants.
+    """
     store = _get_store()
     try:
         vecs = await embeddings.embed([q])
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
-    rows = await store.recall_facts(workspace_id=workspace_id, embedding=vecs[0], k=k, query=q)
+    rows = await store.recall_facts(
+        workspace_id=workspace_id, embedding=vecs[0], k=k, query=q, project_id=project_id
+    )
     return [FactOut(**r) for r in rows]
 
 
@@ -402,10 +413,21 @@ async def list_facts(
     pinned_only: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    project_id: str | None = Query(default=None, description="Narrow to this project + shared"),
 ) -> list[FactOut]:
-    """Browse a workspace's facts — pinned first, then newest. No query, no embedding call."""
+    """Browse facts — pinned first, then newest. No query, no embedding call.
+
+    With ``project_id``, that project's facts and the workspace's shared ones; without it, the
+    whole workspace.
+    """
     store = _get_store()
-    rows = await store.list_facts(workspace_id, pinned_only=pinned_only, limit=limit, offset=offset)
+    rows = await store.list_facts(
+        workspace_id,
+        pinned_only=pinned_only,
+        limit=limit,
+        offset=offset,
+        project_id=project_id,
+    )
     return [FactOut(**r) for r in rows]
 
 
