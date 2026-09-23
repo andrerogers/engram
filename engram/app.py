@@ -461,6 +461,10 @@ async def patch_fact(fact_id: str, req: FactPatch) -> FactOut:
         await store.upsert_fact(
             fact_id=fact_id,
             workspace_id=fact["workspace_id"],
+            # Carried explicitly. `upsert_fact` defaults this to None, so a reworded fact used
+            # to leave its project's pool and become one the whole workspace sees — silently,
+            # and in the direction that leaks.
+            project_id=fact["project_id"],
             content=req.content,
             tags=fact["tags"],
             source=fact["source"],

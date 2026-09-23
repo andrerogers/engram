@@ -290,11 +290,34 @@ def test_editing_a_fact_re_embeds_it_and_keeps_its_workspace() -> None:
     store.upsert_fact.assert_awaited_once_with(
         fact_id="f1",
         workspace_id="ws-1",
+        project_id=None,
         content="uses uv 0.9",
         tags=[],
         source=None,
         embedding=[0.1, 0.2],
     )
+
+
+def test_editing_a_fact_keeps_it_in_its_project_pool() -> None:
+    """A content edit re-upserts, and `upsert_fact` defaults `project_id` to None — so a fact
+    that belonged to a project used to become a workspace-wide one just by being reworded.
+
+    Silent, and in the direction that leaks: "this service owns billing" would quietly start
+    applying to every project in the workspace.
+    """
+    store = _mock_store()
+    store.get_fact = AsyncMock(
+        side_effect=[
+            _fact(project_id="proj-1"),
+            _fact(project_id="proj-1", content="this service owns billing and refunds"),
+        ]
+    )
+    with patch(_STORE, store), patch(_EMBED, new=AsyncMock(return_value=[[0.1, 0.2]])):
+        r = client.patch("/facts/f1", json={"content": "this service owns billing and refunds"})
+
+    assert r.status_code == 200
+    assert r.json()["project_id"] == "proj-1"
+    assert store.upsert_fact.await_args.kwargs["project_id"] == "proj-1"
 
 
 def test_patch_with_nothing_to_change_is_rejected() -> None:
