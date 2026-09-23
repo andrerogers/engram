@@ -1,7 +1,11 @@
 # ruff: noqa: E402
 from optics import instrument_fastapi, setup_optics
 
-setup_optics("engram", service_version="0.0.1")
+# Imported before the Optics bootstrap on purpose: it reads package metadata and a TOML file and
+# pulls in nothing that needs instrumenting, and the version has to be known to bootstrap with it.
+from engram.version import service_version
+
+setup_optics("engram", service_version=service_version())
 
 import hashlib
 import logging
@@ -118,7 +122,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _docling.shutdown()
 
 
-app = FastAPI(title="Engram", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Engram", version=service_version(), lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
