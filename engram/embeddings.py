@@ -10,6 +10,7 @@ import logging
 
 import httpx
 
+from engram import telemetry
 from engram.config import (
     EMBEDDING_BATCH_SIZE,
     EMBEDDING_MODEL,
@@ -58,6 +59,11 @@ async def embed(texts: list[str]) -> list[list[float]]:
     Retries each batch up to 3 times on 429 / 5xx before raising.
     Returns a list of float vectors, one per input text.
     """
+    with telemetry.embedding(len(texts)):
+        return await _embed(texts)
+
+
+async def _embed(texts: list[str]) -> list[list[float]]:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not set — cannot generate embeddings")
 

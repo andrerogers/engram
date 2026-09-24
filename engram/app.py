@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from engram import embeddings
+from engram import embeddings, telemetry
 from engram.clients.docling import DoclingEngine
 from engram.clients.storage import LocalFileObjectStore, ObjectStore
 from engram.config import (
@@ -201,14 +201,15 @@ async def retrieve(
     ),
 ) -> RetrieveResponse:
     store = _get_store()
-    vecs = await embeddings.embed([q])
-    results = await store.retrieve(
-        embedding=vecs[0],
-        collection_id=collection_id,
-        k=k,
-        modalities=modalities,
-        query=q,
-    )
+    with telemetry.recall("chunks", k):
+        vecs = await embeddings.embed([q])
+        results = await store.retrieve(
+            embedding=vecs[0],
+            collection_id=collection_id,
+            k=k,
+            modalities=modalities,
+            query=q,
+        )
     return RetrieveResponse(results=[RetrieveResult(**r) for r in results])
 
 
@@ -401,13 +402,14 @@ async def recall_facts(
     ones — which is what an inspector or a voice session with no project wants.
     """
     store = _get_store()
-    try:
-        vecs = await embeddings.embed([q])
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
-    rows = await store.recall_facts(
-        workspace_id=workspace_id, embedding=vecs[0], k=k, query=q, project_id=project_id
-    )
+    with telemetry.recall("facts", k):
+        try:
+            vecs = await embeddings.embed([q])
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
+        rows = await store.recall_facts(
+            workspace_id=workspace_id, embedding=vecs[0], k=k, query=q, project_id=project_id
+        )
     return [FactOut(**r) for r in rows]
 
 
@@ -527,13 +529,14 @@ async def recall_signals(
 ) -> list[dict[str, object]]:
     """Recall the top-k signals semantically nearest to query."""
     store = _get_store()
-    try:
-        vecs = await embeddings.embed([q])
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
-    return await store.recall_signals(
-        workspace_id=workspace_id,
-        embedding=vecs[0],
-        k=k,
-        signal_type=signal_type,
-    )
+    with telemetry.recall("signals", k):
+        try:
+            vecs = await embeddings.embed([q])
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Embedding unavailable: {exc}") from exc
+        return await store.recall_signals(
+            workspace_id=workspace_id,
+            embedding=vecs[0],
+            k=k,
+            signal_type=signal_type,
+        )

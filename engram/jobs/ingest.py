@@ -13,7 +13,7 @@ import logging
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
-from engram import embeddings
+from engram import embeddings, telemetry
 
 if TYPE_CHECKING:
     from engram.clients.storage.base import ObjectStore
@@ -66,10 +66,12 @@ async def run_ingest_job(
             file_hash=job.get("file_hash"),
         )
         await store.update_ingest_job(job_id, status="completed", document_id=doc_id)
+        telemetry.ingest_finished("completed")
         log.info("ingest job %s completed: doc=%s chunks=%d", job_id, doc_id, chunk_count)
 
     except Exception as exc:
         log.error("ingest job %s failed: %s", job_id, exc)
+        telemetry.ingest_finished("failed")
         with suppress(Exception):
             await store.update_ingest_job(job_id, status="failed", error_message=str(exc))
         if object_key:

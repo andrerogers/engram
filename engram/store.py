@@ -21,6 +21,7 @@ from typing import Any, TypeVar
 
 import sqlite_vec
 
+from engram import telemetry
 from engram.clients.storage.base import ObjectStore
 from engram.hybrid import CANDIDATE_FACTOR, TOKENIZE, fts_query, fuse
 from engram.processors.base import ChunkCandidate
@@ -467,7 +468,9 @@ class Store:
             Store._insert_chunks(c, doc_id, collection_id, candidates, embeddings)
             return doc_id, len(candidates)
 
-        return await self._run(_do)
+        stored = await self._run(_do)
+        telemetry.indexed(stored[1])
+        return stored
 
     # ── Ingest jobs ───────────────────────────────────────────────────────
 
@@ -660,7 +663,8 @@ class Store:
             depth = k * CANDIDATE_FACTOR if match else k
             # The vectors are partitioned by workspace, so a project's own facts and the shared
             # ones come back together — and so do other projects', which the pool filter drops.
-            dense = [i for i, _ in FACTS.similarity_search(c, workspace_id, embedding, depth)]
+            with telemetry.search("vector"):
+                dense = [i for i, _ in FACTS.similarity_search(c, workspace_id, embedding, depth)]
             if project_id:
                 visible = {
                     row[0]
@@ -672,16 +676,17 @@ class Store:
                 dense = [i for i in dense if i in visible]
             ranked = dense
             if match:
-                lexical = [
-                    row[0]
-                    for row in c.execute(
-                        "SELECT f.id FROM facts_fts x JOIN facts f ON f.rowid = x.rowid "
-                        "WHERE facts_fts MATCH ? AND f.workspace_id = ? "
-                        + pool_sql.replace("project_id", "f.project_id")
-                        + " ORDER BY bm25(facts_fts) LIMIT ?",
-                        (match, workspace_id, *pool_params, depth),
-                    )
-                ]
+                with telemetry.search("bm25"):
+                    lexical = [
+                        row[0]
+                        for row in c.execute(
+                            "SELECT f.id FROM facts_fts x JOIN facts f ON f.rowid = x.rowid "
+                            "WHERE facts_fts MATCH ? AND f.workspace_id = ? "
+                            + pool_sql.replace("project_id", "f.project_id")
+                            + " ORDER BY bm25(facts_fts) LIMIT ?",
+                            (match, workspace_id, *pool_params, depth),
+                        )
+                    ]
                 ranked = fuse(dense, lexical)
             results = []
             for fact_id in ranked[:k]:
@@ -781,7 +786,8 @@ class Store:
         filters = {"signal_type": [signal_type]} if signal_type else None
 
         def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
-            hits = SIGNALS.similarity_search(c, workspace_id, embedding, k, filters)
+            with telemetry.search("vector"):
+                hits = SIGNALS.similarity_search(c, workspace_id, embedding, k, filters)
             results = []
             for signal_id, score in hits:
                 r = c.execute(
@@ -825,25 +831,28 @@ class Store:
 
         def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
             depth = k * CANDIDATE_FACTOR if match else k
-            dense = [
-                chunk_id
-                for chunk_id, _ in CHUNKS.similarity_search(
-                    c, collection_id, embedding, depth, {"modality": effective_modalities}
-                )
-            ]
+            with telemetry.search("vector"):
+                dense = [
+                    chunk_id
+                    for chunk_id, _ in CHUNKS.similarity_search(
+                        c, collection_id, embedding, depth, {"modality": effective_modalities}
+                    )
+                ]
             ranked = dense
             if match and effective_modalities:
                 marks = ", ".join("?" * len(effective_modalities))
-                lexical = [
-                    row[0]
-                    for row in c.execute(
-                        "SELECT c.id FROM chunks_fts x JOIN chunks c ON c.rowid = x.rowid "
-                        "JOIN documents d ON d.id = c.document_id "
-                        f"WHERE chunks_fts MATCH ? AND d.collection_id = ? AND c.modality IN ({marks}) "
-                        "ORDER BY bm25(chunks_fts) LIMIT ?",
-                        (match, collection_id, *effective_modalities, depth),
-                    )
-                ]
+                with telemetry.search("bm25"):
+                    lexical = [
+                        row[0]
+                        for row in c.execute(
+                            "SELECT c.id FROM chunks_fts x JOIN chunks c ON c.rowid = x.rowid "
+                            "JOIN documents d ON d.id = c.document_id "
+                            "WHERE chunks_fts MATCH ? AND d.collection_id = ? "
+                            f"AND c.modality IN ({marks}) "
+                            "ORDER BY bm25(chunks_fts) LIMIT ?",
+                            (match, collection_id, *effective_modalities, depth),
+                        )
+                    ]
                 ranked = fuse(dense, lexical)
             results = []
             for chunk_id in ranked[:k]:
