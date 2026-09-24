@@ -32,6 +32,9 @@ log = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+VEC_CHUNK_SIZE = 64
+
+
 def _migrations(dimensions: int) -> tuple[str, ...]:
     """Ordered schema versions, tracked with PRAGMA user_version. Never edit a shipped entry."""
     return (
@@ -164,6 +167,16 @@ def _migrations(dimensions: int) -> tuple[str, ...]:
         """
         ALTER TABLE facts ADD COLUMN project_id TEXT;
         CREATE INDEX facts_project ON facts (workspace_id, project_id);
+        """,
+        # vec0 reserves a block of `chunk_size` vectors per partition the first time a partition
+        # is written, whether it holds one vector or a thousand. The default is 1024, so every
+        # collection and every workspace cost 6 MB at 1536 dimensions: 222 one-chunk collections
+        # made a 1.6 GB engram.db (2026-09-24). At 64 a partition costs ~0.4 MB, and a query over
+        # 5,000 vectors in one partition measured the same (6.7 ms against 6.9 ms at 1024).
+        f"""
+        {CHUNKS.rebuild_sql(dimensions, VEC_CHUNK_SIZE)}
+        {FACTS.rebuild_sql(dimensions, VEC_CHUNK_SIZE)}
+        {SIGNALS.rebuild_sql(dimensions, VEC_CHUNK_SIZE)}
         """,
     )
 

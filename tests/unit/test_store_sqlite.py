@@ -502,3 +502,79 @@ async def test_the_lexical_half_of_recall_respects_the_pool(tmp_path: Path) -> N
     await store.close()
     ids = [f["id"] for f in found]
     assert "mine" in ids and "theirs" not in ids
+
+
+# --- the vector tables' block size -----------------------------------------------------------
+
+
+def _vector_table_sql(store: Store) -> dict[str, str]:
+    return dict(
+        store._execute(
+            lambda c: c.execute(
+                "SELECT name, sql FROM sqlite_master WHERE name IN "
+                "('chunk_vectors', 'fact_vectors', 'signal_vectors')"
+            ).fetchall()
+        )
+    )
+
+
+async def test_a_fresh_database_reserves_small_vector_blocks(store: Store) -> None:
+    tables = _vector_table_sql(store)
+    assert set(tables) == {"chunk_vectors", "fact_vectors", "signal_vectors"}
+    assert all("chunk_size=64" in sql for sql in tables.values())
+
+
+async def test_upgrading_rebuilds_the_vector_tables_and_keeps_every_vector(
+    tmp_path: Path,
+) -> None:
+    from engram.store import CHUNKS, FACTS, SIGNALS, _migrations
+
+    path = tmp_path / "engram.db"
+    old = Store(path, dimensions=DIMS)
+    await old.init_db()
+    cid = await old.get_or_create_collection("ws", "a")
+    await old.index_document(cid, "/a.md", None, [_chunk(0, "kept")], [_vec(1, 0)])
+    await old.upsert_fact("f1", "ws", "kept fact", [], None, _vec(0, 1))
+    # Wind the file back to the last release: vector tables at vec0's default block size.
+    ddl = {t.table: t for t in (CHUNKS, FACTS, SIGNALS)}
+
+    def rewind(c: sqlite3.Connection) -> None:
+        for table in ddl.values():
+            cols = ", ".join([table._id, table._partition, *table._metadata, "embedding"])
+            c.execute(f"CREATE TEMP TABLE keep_{table.table} AS SELECT {cols} FROM {table.table}")
+            c.execute(f"DROP TABLE {table.table}")
+            c.execute(table.ddl(DIMS))
+            c.execute(f"INSERT INTO {table.table} ({cols}) SELECT {cols} FROM keep_{table.table}")
+        c.execute(f"PRAGMA user_version = {len(_migrations(DIMS)) - 1}")
+
+    old._execute(rewind)
+    assert not any("chunk_size" in sql for sql in _vector_table_sql(old).values())
+    await old.close()
+
+    upgraded = Store(path, dimensions=DIMS)
+    await upgraded.init_db()
+    tables = _vector_table_sql(upgraded)
+    hits = await upgraded.retrieve(_vec(1, 0), cid, k=5)
+    facts = await upgraded.recall_facts("ws", _vec(0, 1))
+    await upgraded.close()
+
+    assert all("chunk_size=64" in sql for sql in tables.values())
+    assert [h["content"] for h in hits] == ["kept"]
+    assert [f["id"] for f in facts] == ["f1"]
+
+
+async def test_many_small_collections_stay_small_on_disk(tmp_path: Path) -> None:
+    """At full width. vec0's default block made each one-chunk collection cost 6 MB: 222 of them
+    were a 1.6 GB engram.db."""
+    dims = 1536
+    path = tmp_path / "engram.db"
+    store = Store(path, dimensions=dims)
+    await store.init_db()
+    for i in range(20):
+        cid = await store.get_or_create_collection("ws", f"c{i}")
+        vector = [1.0] + [0.0] * (dims - 1)
+        await store.index_document(cid, f"/{i}.md", None, [_chunk(0, f"doc {i}")], [vector])
+    await store.close()
+
+    # 20 collections at the default block size measured ~120 MB.
+    assert path.stat().st_size < 16 * 1024 * 1024

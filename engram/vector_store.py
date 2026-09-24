@@ -60,14 +60,33 @@ class SqliteVecStore:
         self._partition = partition_column
         self._metadata = tuple(metadata_columns)
 
-    def ddl(self, dimensions: int) -> str:
+    def ddl(self, dimensions: int, *, chunk_size: int | None = None, table: str = "") -> str:
         columns = [
             f"{self._id} TEXT PRIMARY KEY",
             f"{self._partition} TEXT PARTITION KEY",
             *(f"{m} TEXT" for m in self._metadata),
             f"embedding FLOAT[{dimensions}] distance_metric=cosine",
         ]
-        return f"CREATE VIRTUAL TABLE {self.table} USING vec0({', '.join(columns)});"
+        if chunk_size is not None:
+            columns.append(f"chunk_size={chunk_size}")
+        return f"CREATE VIRTUAL TABLE {table or self.table} USING vec0({', '.join(columns)});"
+
+    def rebuild_sql(self, dimensions: int, chunk_size: int) -> str:
+        """Recreate the table with *chunk_size*, keeping every vector.
+
+        vec0 cannot be renamed — ``ALTER TABLE ... RENAME`` breaks on its shadow tables — so the
+        rows go through a scratch table and back under the original name.
+        """
+        cols = ", ".join([self._id, self._partition, *self._metadata, "embedding"])
+        scratch = f"{self.table}_rebuild"
+        return f"""
+        {self.ddl(dimensions, chunk_size=chunk_size, table=scratch)}
+        INSERT INTO {scratch} ({cols}) SELECT {cols} FROM {self.table};
+        DROP TABLE {self.table};
+        {self.ddl(dimensions, chunk_size=chunk_size)}
+        INSERT INTO {self.table} ({cols}) SELECT {cols} FROM {scratch};
+        DROP TABLE {scratch};
+        """
 
     def upsert(
         self,
