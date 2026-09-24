@@ -1,22 +1,33 @@
-"""Embedding client — calls OpenRouter for text-embedding-3-small.
+"""Embedding client — calls OpenRouter for text-embedding-3-small, or a substitute that calls nothing.
 
 Retries each batch on 429 / 5xx with exponential backoff: 0.5s → 1.0s → 2.0s (3 attempts).
+
+``EMBEDDING_PROVIDER=substitute`` is what the e2e suite runs on, beside Hive's substitute chat
+model. Until it existed, the suite was said to spend nothing while every fact, index and recall
+in it was a real OpenRouter call that needed the network and a funded key.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import math
+import re
 
 import httpx
 
 from engram import telemetry
 from engram.config import (
     EMBEDDING_BATCH_SIZE,
+    EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
+    EMBEDDING_PROVIDER,
     OPENROUTER_API_KEY,
     OPENROUTER_EMBEDDINGS_URL,
 )
+
+PROVIDERS = ("openrouter", "substitute")
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +70,35 @@ async def embed(texts: list[str]) -> list[list[float]]:
     Retries each batch up to 3 times on 429 / 5xx before raising.
     Returns a list of float vectors, one per input text.
     """
-    with telemetry.embedding(len(texts)):
+    if EMBEDDING_PROVIDER not in PROVIDERS:
+        raise RuntimeError(
+            f"EMBEDDING_PROVIDER={EMBEDDING_PROVIDER!r} is not one of {', '.join(PROVIDERS)}"
+        )
+    with telemetry.embedding(len(texts), EMBEDDING_PROVIDER):
+        if EMBEDDING_PROVIDER == "substitute":
+            return [substitute_vector(t) for t in texts]
         return await _embed(texts)
+
+
+def substitute_vector(text: str) -> list[float]:
+    """A deterministic unit vector built from the text's words — the hashing trick.
+
+    Each lowercased word adds ±1 to one of the dimensions, chosen by its hash, so two texts that
+    share words point the same way and cosine similarity measures their overlap. That keeps
+    vector search ranking something meaningful rather than noise, which a random or constant
+    vector would not. It knows no synonyms: "deploy" and "release" are unrelated to it.
+    """
+    vector = [0.0] * EMBEDDING_DIMENSIONS
+    for word in re.findall(r"\w+", text.lower()):
+        digest = hashlib.blake2b(word.encode(), digest_size=8).digest()
+        index = int.from_bytes(digest[:4], "big") % EMBEDDING_DIMENSIONS
+        vector[index] += 1.0 if digest[4] & 1 else -1.0
+    norm = math.sqrt(sum(x * x for x in vector))
+    if norm == 0.0:
+        # No words at all. A zero vector has no direction, and cosine against it is undefined.
+        vector[0] = 1.0
+        return vector
+    return [x / norm for x in vector]
 
 
 async def _embed(texts: list[str]) -> list[list[float]]:

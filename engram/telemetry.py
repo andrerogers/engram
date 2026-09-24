@@ -48,12 +48,16 @@ def search(half: str) -> Iterator[None]:
 
 
 @contextmanager
-def embedding(texts: int) -> Iterator[None]:
+def embedding(texts: int, provider: str) -> Iterator[None]:
     """One embed() call, every batch and retry inside it."""
     started = time.monotonic()
     outcome = "error"
     try:
-        with span("engram.embed", attributes={"engram.embed.texts": texts}):
+        attributes: dict[str, str | int | float | bool] = {
+            "engram.embed.texts": texts,
+            "engram.embed.provider": provider,
+        }
+        with span("engram.embed", attributes=attributes):
             yield
         outcome = "ok"
     finally:

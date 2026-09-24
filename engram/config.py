@@ -21,6 +21,9 @@ OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_EMBEDDINGS_URL: str = "https://openrouter.ai/api/v1/embeddings"
 EMBEDDING_MODEL: str = "openai/text-embedding-3-small"
 EMBEDDING_DIMENSIONS: int = 1536
+# "openrouter" calls the model above; "substitute" derives a vector from the text's own words and
+# calls nothing — what the e2e suite runs on (engram/embeddings.py).
+EMBEDDING_PROVIDER: str = os.environ.get("EMBEDDING_PROVIDER", "openrouter").lower()
 
 # Chunking defaults
 CHUNK_SIZE_TOKENS: int = 512
