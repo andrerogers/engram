@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -18,6 +19,23 @@ ENGRAM_OBJECT_DIR: Path = Path(
 ).expanduser()
 ENGRAM_PORT: int = int(os.environ.get("ENGRAM_PORT", "8613"))
 OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
+
+
+def stored_openrouter_key() -> str:
+    """The OpenRouter key the user set in Settings, or "" — read on every call, not at import.
+
+    Hive writes ``<home>/credentials.json`` (``hive/hive/credentials.py``); a key there wins over
+    OPENROUTER_API_KEY. Read per call so a key added in the panel works without a restart.
+    """
+    try:
+        data = json.loads((BRAINSTACK_HOME / "credentials.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    entry = data.get("openrouter") if isinstance(data, dict) else None
+    key = entry.get("api_key") if isinstance(entry, dict) else None
+    return key.strip() if isinstance(key, str) else ""
+
+
 OPENROUTER_EMBEDDINGS_URL: str = "https://openrouter.ai/api/v1/embeddings"
 EMBEDDING_MODEL: str = "openai/text-embedding-3-small"
 EMBEDDING_DIMENSIONS: int = 1536

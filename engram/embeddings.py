@@ -25,6 +25,7 @@ from engram.config import (
     EMBEDDING_PROVIDER,
     OPENROUTER_API_KEY,
     OPENROUTER_EMBEDDINGS_URL,
+    stored_openrouter_key,
 )
 
 PROVIDERS = ("openrouter", "substitute")
@@ -101,9 +102,18 @@ def substitute_vector(text: str) -> list[float]:
     return [x / norm for x in vector]
 
 
+def _api_key() -> str:
+    """Settings first (``<home>/credentials.json``), then OPENROUTER_API_KEY."""
+    return stored_openrouter_key() or OPENROUTER_API_KEY
+
+
 async def _embed(texts: list[str]) -> list[list[float]]:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not set — cannot generate embeddings")
+    api_key = _api_key()
+    if not api_key:
+        raise RuntimeError(
+            "No OpenRouter key — add one in Settings, or set OPENROUTER_API_KEY — "
+            "cannot generate embeddings"
+        )
 
     client = _get_client()
     all_embeddings: list[list[float]] = []
@@ -114,7 +124,7 @@ async def _embed(texts: list[str]) -> list[list[float]]:
             client,
             OPENROUTER_EMBEDDINGS_URL,
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json={

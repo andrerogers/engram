@@ -84,3 +84,20 @@ def test_recall_returns_the_fact_that_shares_the_query_words(
         )
 
     assert r.json()[0]["content"] == "deploys go out on fridays"
+
+
+def test_the_key_set_in_settings_is_used_and_wins(monkeypatch) -> None:
+    """Hive writes the key a user sets in Settings to <home>/credentials.json. Engram read only
+    OPENROUTER_API_KEY, at import — so memory broke for a user who set the key in the panel."""
+    from engram import config
+
+    monkeypatch.setattr(embeddings, "OPENROUTER_API_KEY", "sk-or-from-the-env-9999")
+    path = config.BRAINSTACK_HOME / "credentials.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"openrouter": {"api_key": "sk-or-from-settings-1234"}}')
+    try:
+        assert embeddings._api_key() == "sk-or-from-settings-1234"
+        path.unlink()
+        assert embeddings._api_key() == "sk-or-from-the-env-9999"
+    finally:
+        path.unlink(missing_ok=True)
