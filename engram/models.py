@@ -28,13 +28,6 @@ class IndexResponse(BaseModel):
     chunk_count: int
 
 
-class IndexWorkspaceRequest(BaseModel):
-    workspace_id: str
-    workspace_path: str
-    collection_name: str | None = None
-    file_globs: list[str] | None = None
-
-
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------

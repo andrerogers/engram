@@ -67,18 +67,6 @@ class _FakeJobStore:
         if job_id in self._jobs:
             self._jobs[job_id]["last_heartbeat"] = "2026-01-01T00:00:10+00:00"
 
-    async def list_ingest_jobs(
-        self,
-        collection_id: str | None = None,
-        status: str | None = None,
-    ) -> list[dict[str, Any]]:
-        jobs = list(self._jobs.values())
-        if collection_id:
-            jobs = [j for j in jobs if j["collection_id"] == collection_id]
-        if status:
-            jobs = [j for j in jobs if j["status"] == status]
-        return jobs
-
     async def delete_old_ingest_jobs(self, retention_days: int = 7) -> int:
         terminal = {k: v for k, v in self._jobs.items() if v["status"] in ("completed", "failed")}
         for k in terminal:
@@ -175,28 +163,6 @@ async def test_bump_heartbeat_sets_timestamp(store: _FakeJobStore) -> None:
     assert (await store.get_ingest_job(job_id))["last_heartbeat"] is None  # type: ignore[index]
     await store.bump_heartbeat(job_id)
     assert (await store.get_ingest_job(job_id))["last_heartbeat"] is not None  # type: ignore[index]
-
-
-# ---------------------------------------------------------------------------
-# List
-# ---------------------------------------------------------------------------
-
-
-async def test_list_jobs_by_collection(store: _FakeJobStore) -> None:
-    await store.create_ingest_job("coll-a")
-    await store.create_ingest_job("coll-a")
-    await store.create_ingest_job("coll-b")
-    jobs = await store.list_ingest_jobs(collection_id="coll-a")
-    assert len(jobs) == 2
-    assert all(j["collection_id"] == "coll-a" for j in jobs)
-
-
-async def test_list_jobs_by_status(store: _FakeJobStore) -> None:
-    job_id = await store.create_ingest_job("coll-1")
-    await store.update_ingest_job(job_id, status="completed")
-    await store.create_ingest_job("coll-1")  # pending
-    pending = await store.list_ingest_jobs(status="pending")
-    assert len(pending) == 1
 
 
 # ---------------------------------------------------------------------------

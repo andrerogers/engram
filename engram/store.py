@@ -22,7 +22,6 @@ from typing import Any, TypeVar
 import sqlite_vec
 
 from engram import telemetry
-from engram.clients.storage.base import ObjectStore
 from engram.hybrid import CANDIDATE_FACTOR, TOKENIZE, fts_query, fuse
 from engram.processors.base import ChunkCandidate
 from engram.vector_store import CHUNKS, FACTS, SIGNALS
@@ -559,33 +558,6 @@ class Store:
             )
         )
 
-    async def list_ingest_jobs(
-        self,
-        collection_id: str | None = None,
-        status: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """List jobs newest first, optionally filtered by collection and/or status."""
-        filters: list[str] = []
-        params: list[Any] = []
-        if collection_id:
-            filters.append("collection_id = ?")
-            params.append(collection_id)
-        if status:
-            filters.append("status = ?")
-            params.append(status)
-        where = "WHERE " + " AND ".join(filters) if filters else ""
-
-        def _do(c: sqlite3.Connection) -> list[dict[str, Any]]:
-            rows = c.execute(
-                "SELECT id, collection_id, document_id, status, filename, object_key, "
-                "error_message, last_heartbeat, created_at, updated_at "
-                f"FROM ingest_jobs {where} ORDER BY created_at DESC",
-                params,
-            ).fetchall()
-            return [_job(r, with_hash=False) for r in rows]
-
-        return await self._run(_do)
-
     async def delete_old_ingest_jobs(self, retention_days: int = 7) -> int:
         """Delete completed/failed jobs older than retention_days. Returns count deleted."""
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
@@ -616,13 +588,6 @@ class Store:
                 ).rowcount
             )
         )
-
-    async def _sweep_orphan_objects(self, object_store: ObjectStore) -> int:
-        """Delete object-store keys that have no matching job or document.
-
-        Placeholder until the object store can list its keys.
-        """
-        return 0
 
     # ── Facts ─────────────────────────────────────────────────────────────
 

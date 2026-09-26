@@ -175,9 +175,8 @@ async def test_ingest_job_lifecycle(store: Store) -> None:
 
     doc_id, _ = await store.index_document(cid, None, None, [], [])
     await store.update_ingest_job(job_id, "completed", document_id=doc_id)
-    [listed] = await store.list_ingest_jobs(collection_id=cid, status="completed")
-    assert listed["document_id"] == doc_id
-    assert await store.list_ingest_jobs(status="pending") == []
+    job = await store.get_ingest_job(job_id)
+    assert job is not None and job["status"] == "completed" and job["document_id"] == doc_id
 
 
 async def test_recover_orphan_jobs_requeues_only_stale_heartbeats(store: Store) -> None:

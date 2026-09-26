@@ -121,12 +121,3 @@ class DoclingEngine:
             return self._chunk(self._convert(text.encode("utf-8"), filename))
 
         return await asyncio.to_thread(_run)
-
-    async def convert_file_to_markdown(self, file_bytes: bytes, filename: str) -> str:
-        """Convert *file_bytes* to Markdown."""
-        self._require()
-
-        def _run() -> str:
-            return str(self._convert(file_bytes, filename).export_to_markdown())
-
-        return await asyncio.to_thread(_run)

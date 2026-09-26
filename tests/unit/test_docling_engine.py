@@ -120,9 +120,7 @@ async def test_real_docling_converts_a_pdf() -> None:
     await engine.startup()
 
     data = _FIXTURE_PDF.read_bytes()
-    markdown = await engine.convert_file_to_markdown(data, "sample.pdf")
     chunks = await engine.chunk_hybrid_file(data, "sample.pdf")
 
-    assert markdown.strip()
     assert chunks and all(c["text"].strip() for c in chunks)
     await engine.shutdown()
